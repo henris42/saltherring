@@ -131,4 +131,6 @@ sibling (or set `SALTHERRING_SARDINE_DIR`):
 cmake --preset gcc16 && cmake --build --preset gcc16 && ctest --preset gcc16
 ```
 
+- [user-guide.md](user-guide.md) — the full API, from modeling to migrations
+- [examples/](examples/) — runnable quickstart, column encoding, transactions, migrations
 - [NOTES.md](NOTES.md) — Java-library parity, design decisions, GCC 16.1 quirks

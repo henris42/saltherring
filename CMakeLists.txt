@@ -32,6 +32,12 @@ if(PROJECT_IS_TOP_LEVEL)
       -Wno-missing-field-initializers)
   add_test(NAME saltherring COMMAND test_saltherring)
 
+  # Examples double as compile checks for the documented API.
+  foreach(ex quickstart columns transactions migrations)
+    add_executable(example_${ex} examples/${ex}.cpp)
+    target_link_libraries(example_${ex} PRIVATE saltherring ${SQLITE3_LIBRARY})
+  endforeach()
+
   # Negative-compile proofs (tests/nc): each target must FAIL to build.
   # ctest builds them on demand; WILL_FAIL inverts the result.
   foreach(nc runtime_sql runtime_charptr uint64_column bad_identifier)
