@@ -45,12 +45,19 @@ are the ones that page people at 3am.
 
 ## Changelog handling
 
-- Checksums (FNV-1a 64) cover the up SQL; code migrations checksum a marker,
-  so their bodies can be refactored freely — version them if behavior changes.
-- The down SQL is not checksummed: it is *copied* into
-  `salt_schema_history.down_sql` at apply time, and that stored copy is what
-  `rollback()` and `unwind_missing` execute. What was applied is what
-  unwinds, even from a binary that never knew the migration.
+- Checksums (FNV-1a 64, rule 2) cover version‖description‖up‖down with field
+  separators; code migrations checksum a `<code>` marker, so their bodies can
+  be refactored freely — version them if behavior changes. Rule 1 (up SQL
+  only) predates the stored-down design and is retired; rows carrying an
+  unknown `checksum_rule` are refused as tampered.
+- The down SQL is *copied* into `salt_schema_history.down_sql` at apply time,
+  and that stored copy is what `rollback()` and `unwind_missing` execute —
+  what was applied is what unwinds, even from a binary that never knew the
+  migration. Before any stored down SQL runs, the row is re-verified against
+  its own checksum (`errc::migration_tampered` on mismatch), so write access
+  to the history table is not silently SQL execution at the next rollback.
+  FNV-1a is drift detection, not tamper evidence — see README's security
+  model.
 - `migrate()` per-migration transaction: SQLite and Postgres give
   transactional DDL; MariaDB DDL self-commits (same caveat as Flyway).
 - Out-of-order pending migrations are refused (Flyway's default), duplicates
@@ -83,8 +90,11 @@ plus what this library hit:
 
 - **SQLite**: works without `sqlite3.h` — the header declares the dozen
   entry points itself (frozen ABI) and links `-l:libsqlite3.so.0`.
-  `PRAGMA foreign_keys = ON` at open. Multi-statement `exec` loops on
-  `sqlite3_prepare_v2`'s tail pointer.
+  Hardened open by default (see README); `prepare()` refuses trailing
+  statements via the tail pointer, multi-statement `exec` loops on it.
+  An empty blob must not bind through a null `data()` pointer —
+  `sqlite3_bind_blob(…, nullptr, 0, …)` binds NULL, not a zero-length
+  blob (caught by the conformance suite).
 - **Postgres**: `PQexecParams`, text parameters (binary for bytea), results
   shaped by Oid; ids come from `INSERT ... RETURNING`
   (`dialect.insert_returning`), so `last_insert_id` is never used.

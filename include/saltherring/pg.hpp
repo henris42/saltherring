@@ -90,26 +90,41 @@ class statement final : public backend::statement {
       case oid_int4:
       case oid_int8: {
         std::int64_t i = 0;
-        std::from_chars(text, text + len, i);
+        auto [p, ec] = std::from_chars(text, text + len, i);
+        if (ec != std::errc{} || p != text + len)
+          return fail(errc::type_mismatch, "malformed integer in result");
         return sql_value{i};
       }
+      // numeric arrives as arbitrary-precision text; shaping it into double
+      // is deliberate and lossy beyond 2^53 — use BIGINT/DOUBLE PRECISION
+      // columns (or text) where exactness matters.
       case oid_float4:
       case oid_float8:
       case oid_numeric: {
         double d = 0;
-        std::from_chars(text, text + len, d);
+        auto [p, ec] = std::from_chars(text, text + len, d);
+        if (ec != std::errc{} || p != text + len)
+          return fail(errc::type_mismatch, "malformed number in result");
         return sql_value{d};
       }
       case oid_bytea: {
-        // Text-format bytea: \x-prefixed hex.
+        // Text-format bytea: \x-prefixed hex; anything else is refused
+        // rather than guessed at.
+        if (len < 2 || text[0] != '\\' || text[1] != 'x' || (len - 2) % 2 != 0)
+          return fail(errc::type_mismatch, "malformed bytea in result");
+        auto nib = [](char c) -> int {
+          if (c >= '0' && c <= '9') return c - '0';
+          char l = char(c | 0x20);
+          if (l >= 'a' && l <= 'f') return l - 'a' + 10;
+          return -1;
+        };
         std::vector<std::uint8_t> out;
-        if (len >= 2 && text[0] == '\\' && text[1] == 'x') {
-          out.reserve((len - 2) / 2);
-          auto nib = [](char c) -> unsigned {
-            return c <= '9' ? unsigned(c - '0') : unsigned((c | 0x20) - 'a' + 10);
-          };
-          for (std::size_t i = 2; i + 1 < len; i += 2)
-            out.push_back(std::uint8_t(nib(text[i]) << 4 | nib(text[i + 1])));
+        out.reserve((len - 2) / 2);
+        for (std::size_t i = 2; i + 1 < len; i += 2) {
+          int hi = nib(text[i]), lo = nib(text[i + 1]);
+          if (hi < 0 || lo < 0)
+            return fail(errc::type_mismatch, "malformed bytea in result");
+          out.push_back(std::uint8_t(hi << 4 | lo));
         }
         return sql_value{std::move(out)};
       }

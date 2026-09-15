@@ -1,9 +1,14 @@
 #include <saltherring/saltherring.hpp>
 #include <saltherring/sqlite.hpp>
 
+#include "conformance.hpp"
+
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -87,6 +92,19 @@ struct AccountEntry {
   std::int64_t amount = 0;
 };
 
+struct [[=salt::table("gauges")]] Gauge {
+  [[=salt::auto_pk]] std::int64_t id = 0;
+  std::int8_t small = 0;
+  std::uint32_t wide = 0;
+  std::chrono::sys_seconds at{};  // INTEGER column, epoch seconds
+};
+
+struct [[=salt::table("secrets")]] Secret {
+  [[=salt::auto_pk]] std::int64_t id = 0;
+  [[=salt::sensitive{}]] Level level = Level::warning;
+  Level plain = Level::warning;  // contrast: its bad values may ride in detail
+};
+
 // --- model / DDL ------------------------------------------------------------
 
 static void test_model() {
@@ -141,9 +159,45 @@ static void test_model() {
             "RETURNING \"id\"");
   EXPECT_EQ(salt::detail::update_sql<Setting>(salt::postgres_dialect),
             "UPDATE \"setting\" SET \"value\" = $1 WHERE \"key\" = $2");
-  EXPECT_EQ(salt::detail::adapt_placeholders(
-                "WHERE a = ? AND b = 'lit?eral' AND c = ?", salt::postgres_dialect),
+}
+
+// --- placeholder rewriting is a tokenizer, not a quote toggle ---------------
+
+static void test_tokenizer() {
+  using salt::detail::adapt_placeholders;
+  const salt::dialect& pg = salt::postgres_dialect;
+
+  auto adapt = [&](std::string_view in) -> std::string {
+    auto r = adapt_placeholders(in, pg);
+    return r ? *r : "<error: " + r.error().message + ">";
+  };
+
+  EXPECT_EQ(adapt("WHERE a = ? AND b = 'lit?eral' AND c = ?"),
             "WHERE a = $1 AND b = 'lit?eral' AND c = $2");
+  EXPECT_EQ(adapt("'it''s ?' ?"), "'it''s ?' $1");        // '' doubling
+  EXPECT_EQ(adapt("\"col?\" = ?"), "\"col?\" = $1");      // quoted identifier
+  EXPECT_EQ(adapt("`col?` = ?"), "`col?` = $1");          // backtick identifier
+  EXPECT_EQ(adapt("-- ?\nWHERE x = ?"), "-- ?\nWHERE x = $1");
+  EXPECT_EQ(adapt("SELECT 1 -- trailing ?"), "SELECT 1 -- trailing ?");
+  EXPECT_EQ(adapt("/* ? */ ?"), "/* ? */ $1");
+  EXPECT_EQ(adapt("/* a /* nested ? */ b */ ?"), "/* a /* nested ? */ b */ $1");
+  EXPECT_EQ(adapt("$$ ? $$ ?"), "$$ ? $$ $1");            // dollar-quoted string
+  EXPECT_EQ(adapt("$fn$ body ? $fn$ ?"), "$fn$ body ? $fn$ $1");
+  // ?? escapes a literal ? in code position (Postgres JSON operators).
+  EXPECT_EQ(adapt("data ?? 'k' AND x = ?"), "data ? 'k' AND x = $1");
+
+  // Unbalanced constructs are an error, not a guess.
+  auto uq = adapt_placeholders("'abc", pg);
+  EXPECT(!uq && uq.error().code == salt::errc::prepare);
+  auto uc = adapt_placeholders("/* abc", pg);
+  EXPECT(!uc && uc.error().code == salt::errc::prepare);
+  auto ud = adapt_placeholders("$tag$ never closed", pg);
+  EXPECT(!ud && ud.error().code == salt::errc::prepare);
+
+  // question-style dialects keep ? but still honor the ?? escape and states.
+  auto lite = adapt_placeholders("a ?? b = ?", salt::sqlite_dialect);
+  EXPECT_OK(lite);
+  if (lite) EXPECT_EQ(*lite, "a ? b = ?");
 }
 
 // --- CRUD against SQLite ----------------------------------------------------
@@ -226,6 +280,98 @@ static void test_crud() {
   EXPECT_EQ((*theme)->value, "dark");
 }
 
+// --- SQL text hygiene: literal-only tails, single-statement prepare ---------
+
+static void test_sql_hygiene() {
+  salt::db db = std::move(*salt::sqlite::open_memory());
+  EXPECT_OK(db.create_table<User>());
+  User u{.email = "a@x", .name = "A"};
+  EXPECT_OK(db.insert(u));
+
+  // Runtime-assembled SQL must announce itself. (tests/nc/ proves the
+  // literal-only path cannot take runtime text at all.)
+  std::string tail = "WHERE email = ?";
+  auto q = db.query<User>(salt::unchecked_sql{tail}, std::string("a@x"));
+  EXPECT_OK(q);
+  EXPECT_EQ(q->size(), 1u);
+
+  // prepare() takes exactly one statement: a smuggled second one is refused
+  // before anything runs.
+  auto smuggled = db.exec("UPDATE users SET name = ? ; DELETE FROM users",
+                          std::string("x"));
+  EXPECT(!smuggled);
+  EXPECT(smuggled.error().code == salt::errc::prepare);
+  EXPECT_EQ(*db.count<User>(), 1);
+  EXPECT_EQ((*db.find<User>(u.id))->name, "A");
+
+  // Multi-statement text is exec()'s job — allowed when nothing is bound.
+  EXPECT_OK(db.exec("UPDATE users SET name = 'B'; UPDATE users SET name = 'C'"));
+  EXPECT_EQ((*db.find<User>(u.id))->name, "C");
+
+  // Statement text in errors never contains bound values.
+  auto bad = db.query<User>("WHERE nocolumn = ?", std::string("secret-value"));
+  EXPECT(!bad);
+  EXPECT(!bad.error().sql.contains("secret-value"));
+  EXPECT(!bad.error().message.contains("secret-value"));
+}
+
+// --- integer edges and sys_time columns -------------------------------------
+
+static void test_integer_and_time_columns() {
+  salt::db db = std::move(*salt::sqlite::open_memory());
+  EXPECT_OK(db.create_table<Gauge>());
+
+  Gauge g{.small = -128, .wide = 4294967295u,
+          .at = std::chrono::sys_seconds(std::chrono::seconds(1757900000))};
+  EXPECT_OK(db.insert(g));
+  auto back = db.find<Gauge>(g.id);
+  EXPECT_OK(back);
+  EXPECT_EQ(int((*back)->small), -128);
+  EXPECT_EQ((*back)->wide, 4294967295u);
+  EXPECT((*back)->at == g.at);
+
+  // The time column really is epoch seconds in an INTEGER — sortable and
+  // dialect-independent.
+  auto epoch = db.scalar<std::int64_t>("SELECT at FROM gauges WHERE id = ?", g.id);
+  EXPECT_OK(epoch);
+  EXPECT_EQ(*epoch, 1757900000);
+
+  // A stored value the member cannot hold: out_of_range; the value rides in
+  // detail, never in the message.
+  EXPECT_OK(db.exec("UPDATE gauges SET small = 300"));
+  auto broken = db.find<Gauge>(g.id);
+  EXPECT(!broken);
+  EXPECT(broken.error().code == salt::errc::out_of_range);
+  EXPECT_EQ(broken.error().detail, "300");
+  EXPECT(!broken.error().message.contains("300"));
+}
+
+// --- sensitive columns redact their values from errors ----------------------
+
+static void test_sensitive_redaction() {
+  salt::db db = std::move(*salt::sqlite::open_memory());
+  EXPECT_OK(db.create_table<Secret>());
+  Secret s{.level = Level::fatal_error, .plain = Level::debug_info};
+  EXPECT_OK(db.insert(s));
+
+  // A sensitive column's bad value reaches neither message, detail nor sql.
+  EXPECT_OK(db.exec("UPDATE secrets SET level = 'SSN-12345'"));
+  auto r1 = db.find<Secret>(s.id);
+  EXPECT(!r1);
+  EXPECT(r1.error().code == salt::errc::unknown_enum);
+  EXPECT(r1.error().detail.empty());
+  EXPECT(r1.error().message.contains("redacted"));
+  EXPECT(!r1.error().message.contains("SSN-12345"));
+  EXPECT(!r1.error().sql.contains("SSN-12345"));
+
+  // A plain column keeps the value out of message but offers it in detail.
+  EXPECT_OK(db.exec("UPDATE secrets SET level = 'WARNING', plain = 'LEAKY'"));
+  auto r2 = db.find<Secret>(s.id);
+  EXPECT(!r2);
+  EXPECT_EQ(r2.error().detail, "LEAKY");
+  EXPECT(!r2.error().message.contains("LEAKY"));
+}
+
 // --- sardine-compatible columns ---------------------------------------------
 
 static void test_sardine_columns() {
@@ -284,6 +430,46 @@ static void test_transactions() {
     return db.insert(a).transform([](std::int64_t) {});
   }));
   EXPECT_EQ(*db.count<User>(), 1);
+
+  // An exception out of f: the guard rolls back, the exception continues,
+  // and the connection is left outside any transaction — fully usable.
+  bool threw = false;
+  try {
+    (void)db.transaction([&]() -> salt::result<void> {
+      User x{.email = "x@x", .name = "X"};
+      if (auto i = db.insert(x); !i) return std::unexpected(i.error());
+      throw std::runtime_error("boom");
+    });
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  EXPECT(threw);
+  EXPECT_EQ(*db.count<User>(), 1);  // X rolled back
+
+  // Next transaction begins cleanly; SQLite write intent declared up front.
+  EXPECT_OK(db.transaction([&]() -> salt::result<void> {
+    User y{.email = "y@x", .name = "Y"};
+    return db.insert(y).transform([](std::int64_t) {});
+  }, {.immediate = true}));
+  EXPECT_EQ(*db.count<User>(), 2);
+
+  // Nested transactions are savepoints: an inner failure rolls back only
+  // the inner work, the outer commit survives.
+  EXPECT_OK(db.transaction([&]() -> salt::result<void> {
+    User o{.email = "outer@x", .name = "O"};
+    if (auto i = db.insert(o); !i) return std::unexpected(i.error());
+    auto inner = db.transaction([&]() -> salt::result<void> {
+      User n{.email = "inner@x", .name = "N"};
+      if (auto i = db.insert(n); !i) return std::unexpected(i.error());
+      return salt::fail(salt::errc::exec, "inner abort");
+    });
+    EXPECT(!inner);
+    return {};
+  }));
+  EXPECT_EQ(*db.count<User>(), 3);
+  auto gone = db.query_one<User>("WHERE email = ?", std::string("inner@x"));
+  EXPECT_OK(gone);
+  EXPECT(!gone->has_value());
 }
 
 // --- migrations -------------------------------------------------------------
@@ -324,7 +510,11 @@ static void test_migrations() {
   EXPECT_OK(hist);
   EXPECT_EQ(hist->size(), 2u);
   EXPECT_EQ(hist->at(1).description, "add author");
-  EXPECT(!hist->at(0).applied_at.empty());
+  EXPECT_EQ(hist->at(0).checksum_rule, 2);
+  // applied_at is ISO 8601 UTC — 2026-09-15T12:00:00Z — sortable across hosts.
+  const std::string& at0 = hist->at(0).applied_at;
+  EXPECT_EQ(at0.size(), 20u);
+  EXPECT(at0.size() == 20 && at0[10] == 'T' && at0.back() == 'Z');
 
   // Tampering with an applied migration's SQL is caught by the checksum.
   salt::migration tampered[] = {kV2[0], kV2[1]};
@@ -450,15 +640,96 @@ static void test_changelog_control() {
   auto bad = salt::rollback(db, 2);
   EXPECT(!bad);
   EXPECT(bad.error().code == salt::errc::migration_no_down);
+
+  // A history row edited in the database fails its own checksum: its stored
+  // down SQL is never executed — by rollback() or by unwind_missing.
+  EXPECT_OK(db.exec("UPDATE salt_schema_history SET down_sql = 'DROP TABLE t4' "
+                    "WHERE version = 4"));
+  auto forged = salt::rollback(db, 2);
+  EXPECT(!forged);
+  EXPECT(forged.error().code == salt::errc::migration_tampered);
+  EXPECT_OK(db.exec("INSERT INTO t4 (x) VALUES (1)"));  // t4 was not dropped
+
+  auto forged2 = salt::migrate(db, v2only, {.unwind_missing = true});
+  EXPECT(!forged2);
+  EXPECT(forged2.error().code == salt::errc::migration_tampered);
+
+  // An unknown checksum rule is refused the same way, even by validate().
+  EXPECT_OK(db.exec("UPDATE salt_schema_history SET checksum_rule = 1 "
+                    "WHERE version = 2"));
+  auto vr = salt::validate(db, nodown);
+  EXPECT(!vr);
+  EXPECT(vr.error().code == salt::errc::migration_tampered);
+}
+
+// --- hardened SQLite open ---------------------------------------------------
+
+static void test_sqlite_hardening() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::path dir = fs::temp_directory_path() / "saltherring-hardening-test";
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir);
+  fs::path real = dir / "real.db";
+  {
+    auto d = salt::sqlite::open(real.c_str());
+    EXPECT_OK(d);
+    EXPECT_OK(d->exec("CREATE TABLE t (x INTEGER)"));
+  }
+
+  // NOFOLLOW by default: a symlinked database path is refused.
+  fs::path link = dir / "link.db";
+  fs::create_symlink(real, link, ec);
+  if (!ec) {
+    auto via_link = salt::sqlite::open(link.c_str());
+    EXPECT(!via_link);
+    EXPECT(via_link.error().code == salt::errc::connect);
+    auto followed = salt::sqlite::open(link.c_str(), {.follow_symlinks = true});
+    EXPECT_OK(followed);
+  }
+
+  // create = false refuses to conjure a missing file.
+  auto missing = salt::sqlite::open((dir / "absent.db").c_str(), {.create = false});
+  EXPECT(!missing);
+  EXPECT(missing.error().code == salt::errc::connect);
+
+  // read_only really is.
+  auto ro = salt::sqlite::open(real.c_str(), {.read_only = true});
+  EXPECT_OK(ro);
+  EXPECT(!ro->exec("INSERT INTO t VALUES (1)"));
+
+  // The hardening pragmas took hold.
+  auto d2r = salt::sqlite::open(real.c_str());
+  EXPECT_OK(d2r);
+  salt::db d2 = std::move(*d2r);
+  EXPECT_EQ(*d2.scalar<std::int64_t>("PRAGMA secure_delete"), 1);
+  EXPECT_EQ(*d2.scalar<std::int64_t>("PRAGMA foreign_keys"), 1);
+  EXPECT_EQ(*d2.scalar<std::int64_t>("PRAGMA trusted_schema"), 0);
+
+  // WAL is opt-in.
+  auto wal = salt::sqlite::open((dir / "wal.db").c_str(), {.wal = true});
+  EXPECT_OK(wal);
+  EXPECT_EQ(*wal->scalar<std::string>("PRAGMA journal_mode"), "wal");
+
+  fs::remove_all(dir, ec);
 }
 
 int main() {
   test_model();
+  test_tokenizer();
   test_crud();
+  test_sql_hygiene();
+  test_integer_and_time_columns();
+  test_sensitive_redaction();
   test_sardine_columns();
   test_transactions();
   test_migrations();
   test_changelog_control();
+  test_sqlite_hardening();
+  failures += salt::conformance::run([] {
+    auto d = salt::sqlite::open_memory();
+    return d ? std::move(*d) : salt::db{};
+  });
   if (failures == 0) std::println("all tests passed");
   else std::println("{} FAILURES", failures);
   return failures != 0;

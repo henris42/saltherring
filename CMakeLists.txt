@@ -31,4 +31,16 @@ if(PROJECT_IS_TOP_LEVEL)
   target_compile_options(test_saltherring PRIVATE -Wall -Wextra
       -Wno-missing-field-initializers)
   add_test(NAME saltherring COMMAND test_saltherring)
+
+  # Negative-compile proofs (tests/nc): each target must FAIL to build.
+  # ctest builds them on demand; WILL_FAIL inverts the result.
+  foreach(nc runtime_sql runtime_charptr uint64_column bad_identifier)
+    add_library(nc_${nc} OBJECT tests/nc/${nc}.cpp)
+    target_link_libraries(nc_${nc} PRIVATE saltherring)
+    set_target_properties(nc_${nc} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    add_test(NAME nc_${nc}
+             COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
+                     --target nc_${nc})
+    set_tests_properties(nc_${nc} PROPERTIES WILL_FAIL TRUE)
+  endforeach()
 endif()

@@ -74,6 +74,10 @@ inline constexpr pk auto_pk{true};
 // [[=salt::transient{}]] — not persisted; invisible to DDL, reads and writes.
 struct transient {};
 
+// [[=salt::sensitive{}]] — decode errors for this member never carry the
+// stored value (error.detail is cleared and the message notes the redaction).
+struct sensitive {};
+
 // [[=salt::unique{}]] — UNIQUE column constraint.
 struct unique {};
 
@@ -101,7 +105,30 @@ struct references {
 };
 
 // ---------------------------------------------------------------------------
+// SQL fragments.
+//
+// Statement text handed to db::exec/scalar/query/query_one/count must be a
+// compile-time literal: salt::sql has only a consteval constructor, so
+// formatting user input into SQL does not compile. Values always travel as
+// binds. The one escape hatch for genuinely runtime-assembled SQL is
+// salt::unchecked_sql — deliberately ugly and greppable; a codebase that
+// bans it outside one reviewed module makes injection unrepresentable.
+// ---------------------------------------------------------------------------
+
+struct sql {
+  std::string_view text;
+  consteval sql(const char* s) : text(s) {}
+};
+
+struct unchecked_sql {
+  std::string_view text;
+};
+
+// ---------------------------------------------------------------------------
 // Errors. Same shape as sardine: branch on the code, read the message.
+// error.message never embeds stored values; error.detail may (capped), and
+// is cleared entirely for [[=salt::sensitive{}]] members. error.sql holds
+// statement text only — bound values never appear in errors.
 // ---------------------------------------------------------------------------
 
 enum class errc : std::uint8_t {
@@ -120,19 +147,35 @@ enum class errc : std::uint8_t {
   migration_missing,   // history has a version the migration list lacks
   migration_order,     // a pending migration is older than an applied one
   migration_no_down,   // unwind requested but no down SQL was recorded
+  migration_tampered,  // a history row fails its own checksum — refuse to
+                       // execute its stored down SQL
 };
 
 struct error {
-  std::string message;
+  std::string message;  // human explanation; never contains stored values
+  std::string detail;   // the offending value, when useful; capped; empty
+                        // for sensitive columns
   errc code = errc::exec;
-  std::string sql;  // the statement involved, when there is one
+  std::string sql;      // the statement involved, when there is one; capped
 };
 
 template <typename T>
 using result = std::expected<T, error>;
 
+inline constexpr std::size_t error_text_cap = 512;
+
 inline std::unexpected<error> fail(errc c, std::string msg, std::string sql = {}) {
-  return std::unexpected(error{std::move(msg), c, std::move(sql)});
+  if (sql.size() > error_text_cap) sql.resize(error_text_cap);
+  return std::unexpected(error{std::move(msg), {}, c, std::move(sql)});
+}
+
+// fail with a value-bearing detail (capped; kept out of message on purpose).
+inline std::unexpected<error> fail_d(errc c, std::string msg,
+                                     std::string_view value_detail,
+                                     std::string sql = {}) {
+  auto u = fail(c, std::move(msg), std::move(sql));
+  u.error().detail = std::string(value_detail.substr(0, error_text_cap));
+  return u;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +230,20 @@ inline constexpr dialect mariadb_dialect{
     "BIGINT", "DOUBLE", "TEXT", "VARCHAR(255)", "BLOB", "BOOLEAN",
     "BIGINT PRIMARY KEY AUTO_INCREMENT", false};
 
+// Transaction options for db::transaction. SQLite ignores iso/read_only
+// (it is serializable by construction) but honors immediate — write intent
+// declared up front, the read-modify-write pattern's friend. Postgres and
+// MariaDB render ISOLATION LEVEL / READ ONLY into BEGIN / START TRANSACTION.
+enum class isolation : std::uint8_t {
+  backend_default, read_committed, repeatable_read, serializable,
+};
+
+struct tx_options {
+  isolation iso = isolation::backend_default;
+  bool read_only = false;
+  bool immediate = false;  // SQLite: BEGIN IMMEDIATE
+};
+
 // ---------------------------------------------------------------------------
 // The reflected model: which members persist, under what column name, as
 // which SQL shape. All consteval; names land in static storage.
@@ -228,6 +285,36 @@ template <typename T> struct unwrap_optional { using type = T; };
 template <typename T> struct unwrap_optional<std::optional<T>> { using type = T; };
 template <typename T> using unwrap_optional_t = unwrap_optional<T>::type;
 
+// std::chrono::sys_time<D> members are INTEGER columns holding the epoch
+// tick count in the member's own duration (sys_seconds → epoch seconds).
+template <typename T> struct is_sys_time : std::false_type {};
+template <typename D>
+struct is_sys_time<std::chrono::time_point<std::chrono::system_clock, D>>
+    : std::true_type {};
+
+// A 64-bit unsigned (or wider) integer cannot round-trip through SQL BIGINT:
+// values above INT64_MAX would store negative. Rejected at compile time —
+// store such values as text or a BLOB, deliberately.
+template <typename U>
+concept lossy_integral = std::integral<U> &&
+    (sizeof(U) > 8 || (std::unsigned_integral<U> && sizeof(U) == 8));
+
+// SQL identifiers from annotations: [A-Za-z_][A-Za-z0-9_]*, at most 63
+// chars (the Postgres limit). quoted() does not escape, so nothing that
+// would need escaping may enter — enforced at compile time.
+consteval void require_identifier(std::string_view s) {
+  if (s.empty() || s.size() > 63)
+    throw "saltherring: identifier must be 1..63 characters";
+  auto word = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+  };
+  if (s[0] >= '0' && s[0] <= '9')
+    throw "saltherring: identifier may not start with a digit";
+  for (char c : s)
+    if (!word(c)) throw "saltherring: identifier may contain only [A-Za-z0-9_]";
+}
+
 consteval std::string_view pascal_to_snake(std::string_view id) {
   std::string out;
   for (std::size_t i = 0; i < id.size(); ++i) {
@@ -244,14 +331,18 @@ consteval std::string_view pascal_to_snake(std::string_view id) {
 
 template <typename T>
 consteval std::string_view table_name() {
-  if (auto t = annotation_of<table>(^^T))
+  if (auto t = annotation_of<table>(^^T)) {
+    require_identifier(t->str());
     return std::define_static_string(t->str());
+  }
   return pascal_to_snake(std::meta::identifier_of(^^T));
 }
 
 consteval std::string_view column_name(std::meta::info m) {
-  if (auto c = annotation_of<column>(m))
+  if (auto c = annotation_of<column>(m)) {
+    require_identifier(c->str());
     return std::define_static_string(c->str());
+  }
   return std::meta::identifier_of(m);
 }
 
@@ -260,7 +351,13 @@ consteval col_kind kind_of() {
   using U = unwrap_optional_t<M>;
   if constexpr (std::same_as<U, bool>) return col_kind::boolean;
   else if constexpr (std::is_enum_v<U>) return col_kind::enum_text;
-  else if constexpr (std::integral<U>) return col_kind::integer;
+  else if constexpr (is_sys_time<U>::value) return col_kind::integer;
+  else if constexpr (std::integral<U>) {
+    static_assert(!lossy_integral<U>,
+        "saltherring: 64-bit unsigned (and wider) integers cannot round-trip "
+        "through SQL BIGINT — store as text or a BLOB instead");
+    return col_kind::integer;
+  }
   else if constexpr (std::floating_point<U>) return col_kind::real;
   else if constexpr (byte_sequence<U>) return col_kind::blob;
   else if constexpr (string_like<U>) return col_kind::text;
@@ -300,6 +397,8 @@ consteval auto build_columns() {
       if (auto df = annotation_of<sql_default>(m))
         c.default_expr = std::define_static_string(df->str());
       if (auto r = annotation_of<references>(m)) {
+        require_identifier(r->ref_table.str());
+        require_identifier(r->ref_column.str());
         c.ref_table = std::define_static_string(r->ref_table.str());
         c.ref_column = std::define_static_string(r->ref_column.str());
       }
@@ -393,8 +492,9 @@ result<E> enum_from_text(std::string_view s) {
     auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), raw);
     if (ec == std::errc{} && p == s.data() + s.size()) return static_cast<E>(raw);
   }
-  return fail(errc::unknown_enum,
-              std::format("'{}' is not an enumerator of {}", s, type_name<E>()));
+  constexpr std::string_view tn = type_name<E>();
+  return fail_d(errc::unknown_enum,
+                std::format("value is not an enumerator of {}", tn), s);
 }
 
 template <typename M>
@@ -406,7 +506,12 @@ result<sql_value> to_sql(const M& v) {
     return sql_value{std::int64_t(v)};
   } else if constexpr (std::is_enum_v<M>) {
     return sql_value{enum_text(v)};
+  } else if constexpr (is_sys_time<M>::value) {
+    return sql_value{static_cast<std::int64_t>(v.time_since_epoch().count())};
   } else if constexpr (std::integral<M>) {
+    static_assert(!lossy_integral<M>,
+        "saltherring: 64-bit unsigned (and wider) integers cannot round-trip "
+        "through SQL BIGINT — store as text or a BLOB instead");
     return sql_value{static_cast<std::int64_t>(v)};
   } else if constexpr (std::floating_point<M>) {
     return sql_value{static_cast<double>(v)};
@@ -450,6 +555,12 @@ result<void> from_sql(const sql_value& v, M& out) {
         }
       }
       return fail(errc::type_mismatch, "expected TEXT for an enum column");
+    } else if constexpr (is_sys_time<M>::value) {
+      if (auto* i = std::get_if<std::int64_t>(&v)) {
+        out = M(typename M::duration(*i));
+        return {};
+      }
+      return fail(errc::type_mismatch, "expected an INTEGER epoch time");
     } else if constexpr (std::integral<M>) {
       std::int64_t i;
       if (auto* p = std::get_if<std::int64_t>(&v)) {
@@ -461,8 +572,8 @@ result<void> from_sql(const sql_value& v, M& out) {
         return fail(errc::type_mismatch, "expected an integer");
       }
       if (!std::in_range<M>(i))
-        return fail(errc::out_of_range,
-                    std::format("{} does not fit the member type", i));
+        return fail_d(errc::out_of_range, "integer does not fit the member type",
+                      std::to_string(i));
       out = static_cast<M>(i);
       return {};
     } else if constexpr (std::floating_point<M>) {
@@ -551,20 +662,135 @@ inline void placeholder(std::string& out, const dialect& d, int n) {
   }
 }
 
-// Rewrite user-facing '?' placeholders into the dialect's style, skipping
-// 'string literals'. first is the number the first ? becomes.
-inline std::string adapt_placeholders(std::string_view sql, const dialect& d,
-                                      int first = 1) {
-  if (d.placeholders == placeholder_style::question) return std::string(sql);
+// Rewrite user-facing '?' placeholders into the dialect's style. A real
+// tokenizer, not a quote toggle: 'strings' (with '' doubling), "quoted"
+// and `quoted` identifiers, -- line and (nested) /* block */ comments, and
+// Postgres $tag$ dollar-quoted strings are passed through untouched. `??`
+// in code position is an escape for a literal `?` (Postgres JSON operators).
+// Unbalanced quotes or comments are an error, not a guess. E'…' backslash
+// escapes are not modeled — bind values instead of writing them in tails.
+// first is the number the first ? becomes.
+inline result<std::string> adapt_placeholders(std::string_view sql_text,
+                                              const dialect& d, int first = 1) {
   std::string out;
-  out.reserve(sql.size() + 8);
-  bool in_string = false;
+  out.reserve(sql_text.size() + 8);
   int n = first;
-  for (char c : sql) {
-    if (c == '\'') in_string = !in_string;
-    if (c == '?' && !in_string) placeholder(out, d, n++);
-    else out += c;
+  enum class st : std::uint8_t {
+    code, squote, dquote, bquote, line_comment, block_comment, dollar,
+  };
+  st state = st::code;
+  int block_depth = 0;
+  std::string_view dtag;  // the whole $tag$ opener
+  auto word = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+  };
+  const std::size_t size = sql_text.size();
+  for (std::size_t i = 0; i < size; ++i) {
+    char c = sql_text[i];
+    switch (state) {
+      case st::code:
+        if (c == '?') {
+          if (i + 1 < size && sql_text[i + 1] == '?') {
+            out += '?';  // ?? escape → literal ?
+            ++i;
+          } else {
+            placeholder(out, d, n++);
+          }
+          continue;
+        }
+        if (c == '\'') state = st::squote;
+        else if (c == '"') state = st::dquote;
+        else if (c == '`') state = st::bquote;
+        else if (c == '-' && i + 1 < size && sql_text[i + 1] == '-') {
+          state = st::line_comment;
+          out += "--";
+          ++i;
+          continue;
+        } else if (c == '/' && i + 1 < size && sql_text[i + 1] == '*') {
+          state = st::block_comment;
+          block_depth = 1;
+          out += "/*";
+          ++i;
+          continue;
+        } else if (c == '$' && d.placeholders == placeholder_style::dollar_n) {
+          std::size_t j = i + 1;
+          while (j < size && word(sql_text[j])) ++j;
+          if (j < size && sql_text[j] == '$') {
+            dtag = sql_text.substr(i, j - i + 1);
+            out += dtag;
+            i = j;
+            state = st::dollar;
+            continue;
+          }
+        }
+        out += c;
+        continue;
+      case st::squote:
+        out += c;
+        if (c == '\'') state = st::code;  // '' reads as exit+reenter: harmless
+        continue;
+      case st::dquote:
+        out += c;
+        if (c == '"') state = st::code;
+        continue;
+      case st::bquote:
+        out += c;
+        if (c == '`') state = st::code;
+        continue;
+      case st::line_comment:
+        out += c;
+        if (c == '\n') state = st::code;
+        continue;
+      case st::block_comment:
+        if (c == '*' && i + 1 < size && sql_text[i + 1] == '/') {
+          out += "*/";
+          ++i;
+          if (--block_depth == 0) state = st::code;
+        } else if (c == '/' && i + 1 < size && sql_text[i + 1] == '*') {
+          out += "/*";  // Postgres block comments nest
+          ++i;
+          ++block_depth;
+        } else {
+          out += c;
+        }
+        continue;
+      case st::dollar:
+        if (c == '$' && sql_text.compare(i, dtag.size(), dtag) == 0) {
+          out += dtag;
+          i += dtag.size() - 1;
+          state = st::code;
+        } else {
+          out += c;
+        }
+        continue;
+    }
   }
+  if (state != st::code && state != st::line_comment)
+    return fail(errc::prepare, "unbalanced quote or comment in SQL",
+                std::string(sql_text));
+  return out;
+}
+
+// The first statement of db::transaction, per dialect (see tx_options).
+inline std::string begin_sql(const dialect& d, tx_options o) {
+  if (d.name == "sqlite") return o.immediate ? "BEGIN IMMEDIATE" : "BEGIN";
+  std::string_view iso =
+      o.iso == isolation::read_committed  ? "READ COMMITTED"
+    : o.iso == isolation::repeatable_read ? "REPEATABLE READ"
+    : o.iso == isolation::serializable    ? "SERIALIZABLE"
+                                          : "";
+  if (d.name == "mariadb") {
+    std::string out;
+    if (!iso.empty())
+      out = std::format("SET TRANSACTION ISOLATION LEVEL {}; ", iso);
+    out += "START TRANSACTION";
+    if (o.read_only) out += " READ ONLY";
+    return out;
+  }
+  std::string out = "BEGIN";  // Postgres and standard SQL
+  if (!iso.empty()) out += std::format(" ISOLATION LEVEL {}", iso);
+  if (o.read_only) out += " READ ONLY";
   return out;
 }
 
@@ -738,35 +964,27 @@ class db {
   const dialect& dial() const pre(open()) { return c_->dial(); }
 
   // Raw SQL with ?-placeholders (adapted to the dialect) and typed binds.
-  // (contract_assert, not pre: GCC 16.1 ICEs on pre() when a variadic member
-  // template is instantiated with an empty pack.)
+  // Statement text is a compile-time literal (salt::sql); runtime-assembled
+  // text must announce itself as salt::unchecked_sql. (contract_assert, not
+  // pre: GCC 16.1 ICEs on pre() when a variadic member template is
+  // instantiated with an empty pack.)
   template <typename... Args>
-  result<void> exec(std::string_view sql, const Args&... args) {
-    contract_assert(open());
-    if (!open()) return fail(errc::closed, "db is not open");
-    if constexpr (sizeof...(Args) == 0) {
-      return c_->exec(detail::adapt_placeholders(sql, dial()));
-    } else {
-      auto st = prepare_bound(detail::adapt_placeholders(sql, dial()), args...);
-      if (!st) return std::unexpected(st.error());
-      return (*st)->step().transform([](bool) {});
-    }
+  result<void> exec(sql q, const Args&... args) {
+    return exec_raw(q.text, args...);
+  }
+  template <typename... Args>
+  result<void> exec(unchecked_sql q, const Args&... args) {
+    return exec_raw(q.text, args...);
   }
 
   // One value from a one-row query: db.scalar<std::int64_t>("SELECT COUNT(*)...").
   template <typename V, typename... Args>
-  result<V> scalar(std::string_view sql, const Args&... args) {
-    contract_assert(open());
-    if (!open()) return fail(errc::closed, "db is not open");
-    auto st = prepare_bound(detail::adapt_placeholders(sql, dial()), args...);
-    if (!st) return std::unexpected(st.error());
-    auto row = (*st)->step();
-    if (!row) return std::unexpected(row.error());
-    if (!*row) return fail(errc::no_rows, "query produced no rows", std::string(sql));
-    auto v = (*st)->column(0);
-    if (!v) return std::unexpected(v.error());
-    V out{};
-    return detail::from_sql(*v, out).transform([&] { return std::move(out); });
+  result<V> scalar(sql q, const Args&... args) {
+    return scalar_raw<V>(q.text, args...);
+  }
+  template <typename V, typename... Args>
+  result<V> scalar(unchecked_sql q, const Args&... args) {
+    return scalar_raw<V>(q.text, args...);
   }
 
   template <detail::entity T>
@@ -826,27 +1044,25 @@ class db {
   }
 
   // SELECT with a tail you write: db.query<User>("WHERE balance > ? ORDER BY
-  // name", 10.0). The column list and table come from the model.
+  // name", 10.0). The column list and table come from the model; the tail is
+  // a literal (see salt::sql above).
   template <detail::entity T, typename... Args>
-  result<std::vector<T>> query(std::string_view tail = "", const Args&... args) {
-    contract_assert(open());
-    if (!open()) return fail(errc::closed, "db is not open");
-    std::string sql = detail::select_sql<T>(dial());
-    if (!tail.empty()) {
-      sql += ' ';
-      sql += detail::adapt_placeholders(tail, dial());
-    }
-    return fetch<T>(sql, args...);
+  result<std::vector<T>> query(sql tail = "", const Args&... args) {
+    return query_raw<T>(tail.text, args...);
+  }
+  template <detail::entity T, typename... Args>
+  result<std::vector<T>> query(unchecked_sql tail, const Args&... args) {
+    return query_raw<T>(tail.text, args...);
   }
 
   // First row of a query<T>, if any.
   template <detail::entity T, typename... Args>
-  result<std::optional<T>> query_one(std::string_view tail = "", const Args&... args) {
-    contract_assert(open());
-    auto rows = query<T>(tail, args...);
-    if (!rows) return std::unexpected(rows.error());
-    if (rows->empty()) return std::optional<T>{};
-    return std::optional<T>{std::move(rows->front())};
+  result<std::optional<T>> query_one(sql tail = "", const Args&... args) {
+    return first_of(query_raw<T>(tail.text, args...));
+  }
+  template <detail::entity T, typename... Args>
+  result<std::optional<T>> query_one(unchecked_sql tail, const Args&... args) {
+    return first_of(query_raw<T>(tail.text, args...));
   }
 
   template <detail::keyed_entity T>
@@ -880,34 +1096,134 @@ class db {
   }
 
   template <detail::entity T, typename... Args>
-  result<std::int64_t> count(std::string_view tail = "", const Args&... args) {
-    contract_assert(open());
-    constexpr std::string_view tname = table_of<T>();
-    std::string sql = "SELECT COUNT(*) FROM ";
-    detail::quoted(sql, tname, dial());
-    if (!tail.empty()) {
-      sql += ' ';
-      sql += tail;
-    }
-    return scalar<std::int64_t>(sql, args...);
+  result<std::int64_t> count(sql tail = "", const Args&... args) {
+    return count_raw<T>(tail.text, args...);
+  }
+  template <detail::entity T, typename... Args>
+  result<std::int64_t> count(unchecked_sql tail, const Args&... args) {
+    return count_raw<T>(tail.text, args...);
   }
 
-  // f: () -> result<void>. BEGIN, run, COMMIT — ROLLBACK on error.
+  // f: () -> result<void>. BEGIN (per tx_options), run, COMMIT — with a
+  // rollback guard, so an error *or an exception* out of f leaves the
+  // connection outside any transaction. Nested calls become savepoints and
+  // roll back only their own work.
   template <typename F>
-  result<void> transaction(F&& f) {
+  result<void> transaction(F&& f, tx_options o = {}) {
     contract_assert(open());
-    if (auto b = exec("BEGIN"); !b) return b;
-    result<void> r = std::forward<F>(f)();
-    if (!r) {
-      (void)exec("ROLLBACK");
-      return r;
+    if (!open()) return fail(errc::closed, "db is not open");
+    const int depth = tx_depth_;
+    std::string begin, commit, rollbk;
+    if (depth == 0) {
+      begin = detail::begin_sql(dial(), o);
+      commit = "COMMIT";
+      rollbk = "ROLLBACK";
+    } else {
+      std::string sp = std::format("sp_{}", depth);
+      begin = "SAVEPOINT " + sp;
+      commit = "RELEASE SAVEPOINT " + sp;
+      rollbk = "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp;
     }
-    return exec("COMMIT");
+    if (auto b = c_->exec(begin); !b) return b;
+    ++tx_depth_;
+    struct rollback_guard {
+      db* self;
+      const std::string* rollbk;
+      bool active = true;
+      ~rollback_guard() {
+        if (active) {
+          --self->tx_depth_;
+          (void)self->c_->exec(*rollbk);
+        }
+      }
+    } guard{this, &rollbk};
+    result<void> r = std::forward<F>(f)();
+    if (!r) return r;  // guard rolls back
+    guard.active = false;
+    --tx_depth_;
+    return c_->exec(commit);
   }
 
   backend::connection& raw() pre(open()) { return *c_; }
 
  private:
+  template <typename... Args>
+  result<void> exec_raw(std::string_view text, const Args&... args) {
+    contract_assert(open());
+    if (!open()) return fail(errc::closed, "db is not open");
+    auto adapted = detail::adapt_placeholders(text, dial());
+    if (!adapted) return std::unexpected(adapted.error());
+    if constexpr (sizeof...(Args) == 0) {
+      return c_->exec(*adapted);
+    } else {
+      auto st = prepare_bound(*adapted, args...);
+      if (!st) return std::unexpected(st.error());
+      return (*st)->step().transform([](bool) {});
+    }
+  }
+
+  template <typename V, typename... Args>
+  result<V> scalar_raw(std::string_view text, const Args&... args) {
+    contract_assert(open());
+    if (!open()) return fail(errc::closed, "db is not open");
+    auto adapted = detail::adapt_placeholders(text, dial());
+    if (!adapted) return std::unexpected(adapted.error());
+    return scalar_prepared<V>(*adapted, args...);
+  }
+
+  // The statement text is already in the dialect's placeholder style.
+  template <typename V, typename... Args>
+  result<V> scalar_prepared(const std::string& text, const Args&... args) {
+    auto st = prepare_bound(text, args...);
+    if (!st) return std::unexpected(st.error());
+    auto row = (*st)->step();
+    if (!row) return std::unexpected(row.error());
+    if (!*row) return fail(errc::no_rows, "query produced no rows", text);
+    auto v = (*st)->column(0);
+    if (!v) return std::unexpected(v.error());
+    V out{};
+    return detail::from_sql(*v, out).transform([&] { return std::move(out); });
+  }
+
+  template <detail::entity T, typename... Args>
+  result<std::vector<T>> query_raw(std::string_view tail, const Args&... args) {
+    contract_assert(open());
+    if (!open()) return fail(errc::closed, "db is not open");
+    std::string text = detail::select_sql<T>(dial());
+    if (!tail.empty()) {
+      // Only the tail goes through the rewriter — the generated prefix is
+      // not user text and contains no placeholders.
+      auto adapted = detail::adapt_placeholders(tail, dial());
+      if (!adapted) return std::unexpected(adapted.error());
+      text += ' ';
+      text += *adapted;
+    }
+    return fetch<T>(text, args...);
+  }
+
+  template <detail::entity T, typename... Args>
+  result<std::int64_t> count_raw(std::string_view tail, const Args&... args) {
+    contract_assert(open());
+    if (!open()) return fail(errc::closed, "db is not open");
+    constexpr std::string_view tname = table_of<T>();
+    std::string text = "SELECT COUNT(*) FROM ";
+    detail::quoted(text, tname, dial());
+    if (!tail.empty()) {
+      auto adapted = detail::adapt_placeholders(tail, dial());
+      if (!adapted) return std::unexpected(adapted.error());
+      text += ' ';
+      text += *adapted;
+    }
+    return scalar_prepared<std::int64_t>(text, args...);
+  }
+
+  template <typename T>
+  static result<std::optional<T>> first_of(result<std::vector<T>> rows) {
+    if (!rows) return std::unexpected(rows.error());
+    if (rows->empty()) return std::optional<T>{};
+    return std::optional<T>{std::move(rows->front())};
+  }
+
   template <typename M>
   static result<void> bind_member(backend::statement& st, int& idx, const M& v) {
     auto sv = detail::to_sql(v);
@@ -941,6 +1257,10 @@ class db {
           } else if (r = detail::from_sql(*v, out.[:m:]); !r) {
             constexpr std::string_view cname = detail::column_name(m);
             constexpr std::string_view tname = table_of<T>();
+            if constexpr (detail::has<sensitive>(m)) {
+              r.error().detail.clear();
+              r.error().message += " (value redacted)";
+            }
             r.error().message += std::format(" (column '{}' of {})", cname, tname);
           }
         }
@@ -1011,6 +1331,7 @@ class db {
   }
 
   std::unique_ptr<backend::connection> c_;
+  int tx_depth_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -1038,12 +1359,21 @@ struct migration {
   result<void> (*fn)(db&) = nullptr;    // up as code instead of SQL
 };
 
-// The history table, itself just a persisted struct.
+// The history table, itself just a persisted struct. Each row carries the
+// applied migration verbatim (up and down) plus a checksum over
+// version‖description‖up‖down, so both directions of drift are caught:
+// a migration edited in code no longer matches its row, and a row edited
+// in the database no longer matches its own checksum. FNV-1a is drift
+// detection, not tamper evidence — an attacker with write access to this
+// table can recompute it; cryptographic history (signing, WORM audit) is
+// the application's layer, not this one.
 struct [[=table("salt_schema_history")]] schema_history {
   [[=pk{}]] std::int64_t version = 0;
   std::string description;
   std::int64_t checksum = 0;
-  std::string applied_at;
+  std::int64_t checksum_rule = 0;       // which checksum formula; currently 2
+  std::string applied_at;               // ISO 8601 UTC, e.g. 2026-09-15T12:00:00Z
+  std::string up_sql;                   // as applied ("<code>" for fn migrations)
   std::optional<std::string> down_sql;  // how to unwind, exactly as applied
 };
 
@@ -1066,23 +1396,63 @@ struct validate_report {
 
 namespace detail {
 
-// Checksums cover the up SQL (or a marker for code migrations); the down
-// SQL is stored verbatim instead — the copy in history is what unwinds.
-inline std::int64_t checksum(const migration& m) {
-  std::uint64_t h = 0xcbf29ce484222325u;  // FNV-1a 64
+inline constexpr std::int64_t checksum_rule_current = 2;
+
+// FNV-1a 64 over version‖description‖up‖down with field separators.
+// Rule 1 (up SQL only) predates the stored-down design and is retired.
+inline std::int64_t checksum_fields(std::int64_t version,
+                                    std::string_view description,
+                                    std::string_view up, std::string_view down) {
+  std::uint64_t h = 0xcbf29ce484222325u;
   auto mix = [&](std::string_view s) {
     for (unsigned char c : s) {
       h ^= c;
       h *= 0x100000001b3u;
     }
+    h ^= 0x1f;  // field separator, so "ab"+"c" != "a"+"bc"
+    h *= 0x100000001b3u;
   };
-  mix(m.fn ? std::string_view("<code>") : m.sql);
+  char buf[24];
+  auto [end, ec] = std::to_chars(buf, buf + sizeof buf, version);
+  mix(std::string_view(buf, end));
+  mix(description);
+  mix(up);
+  mix(down);
   return std::bit_cast<std::int64_t>(h);
 }
 
+inline std::string_view up_text(const migration& m) {
+  return m.fn ? std::string_view("<code>") : m.sql;
+}
+
+inline std::int64_t checksum(const migration& m) {
+  return checksum_fields(m.version, m.description, up_text(m), m.down);
+}
+
+inline std::int64_t checksum(const schema_history& r) {
+  return checksum_fields(r.version, r.description, r.up_sql,
+                         r.down_sql ? std::string_view(*r.down_sql)
+                                    : std::string_view{});
+}
+
+// A history row must match its own checksum before anything trusts it —
+// in particular before its stored down SQL is executed.
+inline result<void> verify_row(const schema_history& r) {
+  if (r.checksum_rule != checksum_rule_current)
+    return fail(errc::migration_tampered,
+                std::format("history row for migration {} ('{}') uses unknown "
+                            "checksum rule {}", r.version, r.description,
+                            r.checksum_rule));
+  if (checksum(r) != r.checksum)
+    return fail(errc::migration_tampered,
+                std::format("history row for migration {} ('{}') does not match "
+                            "its checksum", r.version, r.description));
+  return {};
+}
+
 inline std::string now_text() {
-  return std::format("{:%F %T}", std::chrono::floor<std::chrono::seconds>(
-                                     std::chrono::system_clock::now()));
+  return std::format("{:%FT%T}Z", std::chrono::floor<std::chrono::seconds>(
+                                      std::chrono::system_clock::now()));
 }
 
 // The sorted migration list (duplicates rejected) plus the sorted history.
@@ -1109,12 +1479,13 @@ inline result<changelog> load_changelog(db& d, std::span<const migration> in) {
 }
 
 inline result<void> unwind_one(db& d, const schema_history& row) {
+  if (auto v = verify_row(row); !v) return v;  // never run tampered down SQL
   if (!row.down_sql)
     return fail(errc::migration_no_down,
                 std::format("migration {} ('{}') recorded no down SQL",
                             row.version, row.description));
   return d.transaction([&]() -> result<void> {
-    if (auto r = d.exec(*row.down_sql); !r) return r;
+    if (auto r = d.exec(unchecked_sql{*row.down_sql}); !r) return r;
     return d.erase<schema_history>(row.version);
   });
 }
@@ -1130,6 +1501,7 @@ inline result<validate_report> validate(db& d, std::span<const migration> list)
   if (!c) return std::unexpected(c.error());
   validate_report report;
   for (const schema_history& row : c->applied) {
+    if (auto v = detail::verify_row(row); !v) return std::unexpected(v.error());
     auto it = std::ranges::find(c->list, row.version, &migration::version);
     if (it == c->list.end())
       return fail(errc::migration_missing,
@@ -1174,9 +1546,11 @@ inline result<migrate_report> migrate(db& d, std::span<const migration> list,
     ++report.unwound;
   }
 
-  // Prove what remains applied.
+  // Prove what remains applied: each row against itself, then against the
+  // list.
   std::int64_t newest_applied = 0;
   for (const schema_history& row : known) {
+    if (auto v = detail::verify_row(row); !v) return std::unexpected(v.error());
     auto it = std::ranges::find(c->list, row.version, &migration::version);
     if (detail::checksum(*it) != row.checksum)
       return fail(errc::migration_checksum,
@@ -1198,13 +1572,15 @@ inline result<migrate_report> migrate(db& d, std::span<const migration> list,
       if (m.fn) {
         if (auto r = m.fn(d); !r) return r;
       } else {
-        if (auto r = d.exec(m.sql); !r) return r;
+        if (auto r = d.exec(unchecked_sql{m.sql}); !r) return r;
       }
       schema_history row{
           .version = m.version,
           .description = std::string(m.description),
           .checksum = detail::checksum(m),
+          .checksum_rule = detail::checksum_rule_current,
           .applied_at = detail::now_text(),
+          .up_sql = std::string(detail::up_text(m)),
           .down_sql = m.down.empty()
                           ? std::optional<std::string>{}
                           : std::optional<std::string>(std::string(m.down)),
