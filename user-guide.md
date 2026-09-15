@@ -159,8 +159,15 @@ auto ro  = salt::sqlite::open("app.db", {.read_only = true});
 
 Always on: extended result codes, defensive mode, extension loading
 disabled, `PRAGMA foreign_keys = ON`, `PRAGMA trusted_schema = OFF`, and a
-minimum library version of 3.35.0 (older libraries fail `open()` rather
+minimum library version of 3.37.0 (older libraries fail `open()` rather
 than failing mysteriously mid-migration).
+
+Deployment tips for sensitive data: consider vendoring the SQLite
+amalgamation compiled with `SQLITE_SECURE_DELETE`,
+`SQLITE_OMIT_LOAD_EXTENSION` and `SQLITE_DQS=0` instead of trusting
+whatever shared library the container image ships; keep the database file
+0600 in a 0700 directory; back up with `VACUUM INTO`, not by copying the
+file (a copy taken mid-write is corrupt).
 
 ### PostgreSQL and MariaDB
 

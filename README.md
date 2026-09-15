@@ -1,42 +1,38 @@
 # saltherring
 
-SQL persistence for C++26: tables, typed queries and schema version control
-for any struct, out of the box. Reflection maps objects to rows, annotations
-declare the schema, contracts guard the API — no macros, no codegen, no
-interface to implement. Column encoding is shared with
-[sardine](https://github.com/henris42/sardine): what sardine can serialize, saltherring can persist.
+ORM and schema migrations for C++26. Reflection maps structs to rows,
+annotations declare the schema. No macros, no code generation, no base
+classes. Column values are encoded the same way as
+[sardine](https://github.com/henris42/sardine), so anything sardine can
+serialize can be stored in a column.
 
 ```cpp
 struct [[=salt::table("users")]] User {
-  [[=salt::auto_pk]]  std::int64_t id = 0;   // DB-assigned, written back
+  [[=salt::auto_pk]]  std::int64_t id = 0;   // assigned by the DB on insert
   [[=salt::unique{}]] std::string email;
   std::string name;
   [[=salt::check("balance >= 0")]] double balance = 0;
   std::optional<std::string> nickname;       // nullable column
-  Address addr;                              // any sardine type → JSON TEXT
-  [[=salt::transient{}]] int cache = -1;     // not persisted
+  Address addr;                              // any sardine type, stored as JSON
 };
 
 salt::db db = *salt::sqlite::open("app.db");
-db.create_table<User>();                     // CREATE TABLE IF NOT EXISTS ...
+db.create_table<User>();
 
 User u{.email = "henri@example.com", .name = "Henri", .balance = 12.5};
-db.insert(u);                                // u.id is now the row id
-std::expected<std::optional<User>, salt::error> back = db.find<User>(u.id);
+db.insert(u);                                // u.id is now set
 auto rich = db.query<User>("WHERE balance > ? ORDER BY name", 10.0);
 db.update(u);
 db.erase<User>(u.id);
 ```
 
-Everything returns `std::expected` with a coded `salt::error`, sardine-style.
-Enums store their sardine wire name (`rename_all` honored), `uint8_t`
-sequences store as BLOBs, and any other sardine-serializable member —
-nested structs, vectors, maps, variants — rides in a TEXT column as sardine
-JSON.
+Every call returns `std::expected<T, salt::error>`.
 
-## Schema version control
+Statement text must be a compile-time literal; building SQL from strings
+at runtime does not compile unless you write `salt::unchecked_sql`
+explicitly. Values always travel as bound parameters.
 
-Flyway-shaped, with the changelog proven on every run and unwindable:
+## Migrations
 
 ```cpp
 constexpr salt::migration schema[] = {
@@ -48,108 +44,45 @@ constexpr salt::migration schema[] = {
      .down = "ALTER TABLE users DROP COLUMN nickname"},
 };
 
-salt::migrate(db, schema);      // applies what's pending, verifies the rest
-salt::validate(db, schema);     // the same proof, applying nothing
-salt::rollback(db, 1);          // unwind back to version 1, newest first
+salt::migrate(db, schema);      // apply what's pending, verify the rest
+salt::rollback(db, 1);          // unwind back to version 1
 ```
 
-Applied migrations land in `salt_schema_history` with a checksum over
-version‖description‖up‖down and a verbatim copy of the down SQL. Editing an
-applied migration is an error; a history row that no longer matches its own
-checksum is refused (`errc::migration_tampered`) before its stored down SQL
-would run. The recorded down SQL is what unwinds, so a new deployment can
-roll back changelog entries whose code it no longer carries:
-`salt::migrate(db, schema, {.unwind_missing = true})`.
+Works like Flyway: applied migrations are recorded in a history table
+with a checksum, and editing an already-applied migration is an error.
+The down SQL is recorded too, so rollback works even from a binary that
+no longer contains the migration. History rows that fail their checksum
+are refused before their down SQL would run.
 
 ## Backends
 
-| driver | header | status |
+| driver | header | needs |
 |---|---|---|
-| SQLite | `<saltherring/sqlite.hpp>` | tested; needs only the shared library |
-| PostgreSQL | `<saltherring/pg.hpp>` | tested against a real server (postgres:17); needs libpq-dev to build |
-| MariaDB/MySQL | `<saltherring/mariadb.hpp>` | tested against a real server (mariadb:11.4); needs libmariadb-dev to build |
-| Oracle 23ai+ | `<saltherring/oracle.hpp>` | tested against a real server (gvenzl/oracle-free 23ai); needs the Instant Client SDK to build (`-DSALTHERRING_ORACLE_CLIENT_DIR=...`) |
+| SQLite | `<saltherring/sqlite.hpp>` | just `libsqlite3.so.0` (3.37+) |
+| PostgreSQL | `<saltherring/pg.hpp>` | libpq-dev |
+| MariaDB/MySQL | `<saltherring/mariadb.hpp>` | libmariadb-dev |
+| Oracle 23ai+ | `<saltherring/oracle.hpp>` | Instant Client SDK |
 
-All four pass the driver conformance suite. The server suites run against
-containers: `scripts/server-tests.sh` (Docker Compose) starts PostgreSQL,
-MariaDB and Oracle Free, runs `ctest -L server`, and tears them down;
-without a reachable server those tests report as skipped, so plain `ctest`
-needs no Docker.
+All four pass the same conformance suite, tested against real servers in
+containers (`scripts/server-tests.sh`). Without Docker the server tests
+skip and the rest of `ctest` runs normally. Install and setup details per
+backend are in
+[user-guide.md](user-guide.md#backend-setup-what-each-one-needs-on-the-host).
 
-Per-backend host requirements — which packages to install, how the Oracle
-Instant Client must resolve at runtime, the Ubuntu 24.04 libaio symlink —
-are documented in
-[user-guide.md § Backend setup](user-guide.md#backend-setup-what-each-one-needs-on-the-host).
-
-Oracle semantics the driver surfaces rather than hides: `''` IS NULL
-(an empty optional string reads back as `nullopt`; a non-optional empty
-string violates NOT NULL), text columns are `VARCHAR2(4000)` (larger text
-belongs in a BLOB), identifiers are stored quoted-UPPERCASE so unquoted
-names in SQL tails keep working, and DDL commits implicitly (the same
-migration caveat as MariaDB).
-
-SQL generation is a pure function of (reflected model, dialect), so the
-Postgres and MariaDB texts — `$1` placeholders, `BIGSERIAL`/`AUTO_INCREMENT`,
-`RETURNING`, backtick quoting, `VARCHAR` keys — are unit-tested without a
-server.
-
-## Security model
-
-**SQL text is compile-time by construction.** Statement tails for
-`exec`/`scalar`/`query`/`query_one`/`count` are `salt::sql`, whose only
-constructor is `consteval` — formatting user input into SQL does not
-compile (proven by the negative-compile tests in `tests/nc/`). Values
-always travel as binds. The one escape hatch for genuinely
-runtime-assembled SQL is `salt::unchecked_sql`, deliberately ugly and
-greppable; ban it outside one reviewed module and injection is
-unrepresentable. Identifier annotations (`table`, `column`, `references`)
-admit only `[A-Za-z_][A-Za-z0-9_]*` (≤ 63 chars), enforced at compile
-time. `check`/`sql_default` expressions and migration SQL are trusted
-developer text.
-
-**Errors keep values out of logs.** `error.message` never embeds stored
-values; the offending value rides in `error.detail` (capped at 512 bytes),
-and `[[=salt::sensitive{}]]` members clear even that. `error.sql` holds
-statement text only — bound values never appear.
-
-**What the migration checksum proves — and doesn't.** FNV-1a over
-version‖description‖up‖down catches drift in both directions: an edited
-migration no longer matches its row, an edited row no longer matches its
-own checksum and its down SQL is refused. It is *not* tamper evidence
-against an attacker who can write `salt_schema_history` and recompute the
-hash — cryptographic history (signing, WORM audit) is the application's
-layer.
-
-**Threading.** A `salt::db` is one connection and is not thread-safe.
-Pooling is the application's job; the pattern is one `db` per worker,
-never shared across threads.
-
-**SQLite deployment.** `salt::sqlite::open()` is hardened by default —
-NOFOLLOW, URI filenames off, defensive mode, extension loading off,
-`trusted_schema` OFF, `secure_delete` ON, `synchronous` FULL, busy
-timeout, minimum library version 3.35 — each with an off switch in
-`salt::sqlite::options`. For CA-grade deployments vendor the amalgamation
-(`SQLITE_SECURE_DELETE`, `SQLITE_OMIT_LOAD_EXTENSION`, `SQLITE_DQS=0`)
-instead of trusting the container's shared library; keep the file 0600 in
-a 0700 directory and back up with `VACUUM INTO`, not file copy.
-
-## Driver conformance
-
-`tests/conformance.hpp` is the `backend::connection` contract as
-executable checks — storage-class round-trips at their edges, NULL vs
-empty, single-statement `prepare`, multi-statement `exec`, transaction
-rollback, savepoints. The SQLite driver passes it in CI; point it at any
-`salt::db` factory to certify another driver.
+Worth knowing: error messages never include stored values, SQLite files
+open with hardened defaults, and a `salt::db` is one connection and not
+thread-safe (use one per thread). Details in the
+[user guide](user-guide.md).
 
 ## Building
 
-GCC 16.1, `-std=c++26 -freflection -fcontracts`, sardine checked out as a
-sibling (or set `SALTHERRING_SARDINE_DIR`):
+GCC 16.1 with `-std=c++26 -freflection -fcontracts`, sardine checked out
+as a sibling (or set `SALTHERRING_SARDINE_DIR`):
 
 ```
 cmake --preset gcc16 && cmake --build --preset gcc16 && ctest --preset gcc16
 ```
 
-- [user-guide.md](user-guide.md) — the full API, from modeling to migrations
-- [examples/](examples/) — runnable quickstart, column encoding, transactions, migrations
-- [NOTES.md](NOTES.md) — Java-library parity, design decisions, GCC 16.1 quirks
+- [user-guide.md](user-guide.md) — the full API
+- [examples/](examples/) — runnable examples
+- [NOTES.md](NOTES.md) — design decisions, GCC 16.1 quirks
