@@ -1,0 +1,1 @@
+/home/hs/toolchains/stage/usr/local/bin/g++ -g CMakeFiles/example_columns.dir/examples/columns.cpp.o -o example_columns  -l:libsqlite3.so.0 -lstdc++exp

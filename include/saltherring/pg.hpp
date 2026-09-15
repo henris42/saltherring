@@ -45,6 +45,7 @@ class statement final : public backend::statement {
     if (params_.size() < std::size_t(index)) params_.resize(std::size_t(index));
     param& p = params_[std::size_t(index) - 1];
     p = {};
+    bool nul_in_text = false;
     std::visit(
         [&](const auto& x) {
           using X = std::remove_cvref_t<decltype(x)>;
@@ -57,6 +58,10 @@ class statement final : public backend::statement {
             auto [end, ec] = std::to_chars(buf, buf + sizeof buf, x);
             p.text.assign(buf, end);
           } else if constexpr (std::same_as<X, std::string>) {
+            // Postgres TEXT cannot hold NUL, and a text-format parameter is
+            // read to its terminator — an embedded NUL would silently
+            // truncate. Refuse loudly instead.
+            nul_in_text = x.find('\0') != std::string::npos;
             p.text = x;
           } else {  // bytea travels binary
             p.text.assign(reinterpret_cast<const char*>(x.data()), x.size());
@@ -64,6 +69,10 @@ class statement final : public backend::statement {
           }
         },
         v);
+    if (nul_in_text)
+      return fail(errc::bind,
+                  std::format("bind {}: NUL byte in TEXT value — Postgres TEXT "
+                              "cannot store it; use a BLOB column", index));
     return {};
   }
 
@@ -135,6 +144,18 @@ class statement final : public backend::statement {
 
   int column_count() override { return res_ ? PQnfields(res_) : 0; }
 
+  result<std::int64_t> affected() override {
+    if (!res_) return fail(errc::exec, "affected() before the statement ran");
+    const char* t = PQcmdTuples(res_);
+    if (!t || !*t) return std::int64_t{0};  // e.g. a SELECT: no command tuples
+    std::int64_t n = 0;
+    auto [p, ec] = std::from_chars(t, t + std::char_traits<char>::length(t), n);
+    if (ec != std::errc{})
+      return fail(errc::exec, "malformed command tuple count");
+    (void)p;
+    return n;
+  }
+
  private:
   struct param {
     std::string text;
@@ -153,8 +174,13 @@ class statement final : public backend::statement {
     res_ = PQexecParams(c_, sql_.c_str(), int(params_.size()), nullptr,
                         values.data(), lengths.data(), formats.data(), 0);
     auto st = PQresultStatus(res_);
-    if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK)
-      return fail(errc::exec, PQerrorMessage(c_), sql_);
+    if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) {
+      // SQLSTATE class 23 = integrity constraint violation.
+      const char* state = PQresultErrorField(res_, PG_DIAG_SQLSTATE);
+      const bool is_constraint = state && state[0] == '2' && state[1] == '3';
+      return fail(is_constraint ? errc::constraint : errc::exec,
+                  PQerrorMessage(c_), sql_);
+    }
     return {};
   }
 

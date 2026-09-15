@@ -66,8 +66,27 @@ roll back changelog entries whose code it no longer carries:
 | driver | header | status |
 |---|---|---|
 | SQLite | `<saltherring/sqlite.hpp>` | tested; needs only the shared library |
-| PostgreSQL | `<saltherring/pg.hpp>` | dialect tested; driver compiles where libpq-dev exists |
-| MariaDB/MySQL | `<saltherring/mariadb.hpp>` | dialect tested; driver compiles where client headers exist |
+| PostgreSQL | `<saltherring/pg.hpp>` | tested against a real server (postgres:17); needs libpq-dev to build |
+| MariaDB/MySQL | `<saltherring/mariadb.hpp>` | tested against a real server (mariadb:11.4); needs libmariadb-dev to build |
+| Oracle 23ai+ | `<saltherring/oracle.hpp>` | tested against a real server (gvenzl/oracle-free 23ai); needs the Instant Client SDK to build (`-DSALTHERRING_ORACLE_CLIENT_DIR=...`) |
+
+All four pass the driver conformance suite. The server suites run against
+containers: `scripts/server-tests.sh` (Docker Compose) starts PostgreSQL,
+MariaDB and Oracle Free, runs `ctest -L server`, and tears them down;
+without a reachable server those tests report as skipped, so plain `ctest`
+needs no Docker.
+
+Per-backend host requirements — which packages to install, how the Oracle
+Instant Client must resolve at runtime, the Ubuntu 24.04 libaio symlink —
+are documented in
+[user-guide.md § Backend setup](user-guide.md#backend-setup-what-each-one-needs-on-the-host).
+
+Oracle semantics the driver surfaces rather than hides: `''` IS NULL
+(an empty optional string reads back as `nullopt`; a non-optional empty
+string violates NOT NULL), text columns are `VARCHAR2(4000)` (larger text
+belongs in a BLOB), identifiers are stored quoted-UPPERCASE so unquoted
+names in SQL tails keep working, and DDL commits implicitly (the same
+migration caveat as MariaDB).
 
 SQL generation is a pure function of (reflected model, dialect), so the
 Postgres and MariaDB texts — `$1` placeholders, `BIGSERIAL`/`AUTO_INCREMENT`,

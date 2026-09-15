@@ -1,0 +1,205 @@
+Start testing: Sep 15 05:27 EEST
+----------------------------------------------------------
+1/6 Testing: saltherring
+1/6 Test: saltherring
+Command: "/home/hs/saltherring/build-trunk/test_saltherring"
+Directory: /home/hs/saltherring/build-trunk
+"saltherring" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+all tests passed
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"saltherring" end time: Sep 15 05:27 EEST
+"saltherring" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/6 Testing: nc_runtime_sql
+2/6 Test: nc_runtime_sql
+Command: "/usr/bin/cmake" "--build" "/home/hs/saltherring/build-trunk" "--target" "nc_runtime_sql"
+Directory: /home/hs/saltherring/build-trunk
+"nc_runtime_sql" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+[100%] Building CXX object CMakeFiles/nc_runtime_sql.dir/tests/nc/runtime_sql.cpp.o
+/home/hs/saltherring/tests/nc/runtime_sql.cpp: In function 'int main()':
+/home/hs/saltherring/tests/nc/runtime_sql.cpp:16:23: error: no matching function for call to 'salt::db::query<User>(std::string&)'
+   16 |   (void)db.query<User>(tail);  // error: no overload takes runtime text
+      |         ~~~~~~~~~~~~~~^~~~~~
+  • there are 2 candidates
+In file included from /home/hs/saltherring/tests/nc/runtime_sql.cpp:3:
+    • candidate 1: 'template<class T, class ... Args>  requires  entity<T> salt::result<std::vector<T> > salt::db::query(salt::sql, const Args& ...)'
+      /home/hs/saltherring/include/saltherring/saltherring.hpp:1091:26:
+       1091 |   result<std::vector<T>> query(sql tail = "", const Args&... args) {
+            |                          ^~~~~
+      • template argument deduction/substitution failed:
+        •   cannot convert 'tail' (type 'std::string' {aka 'std::__cxx11::basic_string<char>'}) to type 'salt::sql'
+          /home/hs/saltherring/tests/nc/runtime_sql.cpp:16:24:
+             16 |   (void)db.query<User>(tail);  // error: no overload takes runtime text
+                |                        ^~~~
+    • candidate 2: 'template<class T, class ... Args>  requires  entity<T> salt::result<std::vector<T> > salt::db::query(salt::unchecked_sql, const Args& ...)'
+      /home/hs/saltherring/include/saltherring/saltherring.hpp:1095:26:
+       1095 |   result<std::vector<T>> query(unchecked_sql tail, const Args&... args) {
+            |                          ^~~~~
+      • template argument deduction/substitution failed:
+        •   cannot convert 'tail' (type 'std::string' {aka 'std::__cxx11::basic_string<char>'}) to type 'salt::unchecked_sql'
+          /home/hs/saltherring/tests/nc/runtime_sql.cpp:16:24:
+             16 |   (void)db.query<User>(tail);  // error: no overload takes runtime text
+                |                        ^~~~
+gmake[3]: *** [CMakeFiles/nc_runtime_sql.dir/build.make:79: CMakeFiles/nc_runtime_sql.dir/tests/nc/runtime_sql.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:264: CMakeFiles/nc_runtime_sql.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:271: CMakeFiles/nc_runtime_sql.dir/rule] Error 2
+gmake: *** [Makefile:199: nc_runtime_sql] Error 2
+<end of output>
+Test time =   3.75 sec
+----------------------------------------------------------
+Test Passed.
+"nc_runtime_sql" end time: Sep 15 05:27 EEST
+"nc_runtime_sql" time elapsed: 00:00:03
+----------------------------------------------------------
+
+3/6 Testing: nc_runtime_charptr
+3/6 Test: nc_runtime_charptr
+Command: "/usr/bin/cmake" "--build" "/home/hs/saltherring/build-trunk" "--target" "nc_runtime_charptr"
+Directory: /home/hs/saltherring/build-trunk
+"nc_runtime_charptr" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+[100%] Building CXX object CMakeFiles/nc_runtime_charptr.dir/tests/nc/runtime_charptr.cpp.o
+/home/hs/saltherring/tests/nc/runtime_charptr.cpp: In function 'int main()':
+/home/hs/saltherring/tests/nc/runtime_charptr.cpp:11:17: error: call to consteval function 'salt::sql(text)' is not a constant expression
+   11 |   (void)db.exec(text);  // error: consteval sql(const char*) needs a constant
+      |                 ^~~~
+/home/hs/saltherring/tests/nc/runtime_charptr.cpp:11:17: error: the value of 'text' is not usable in a constant expression
+/home/hs/saltherring/tests/nc/runtime_charptr.cpp:10:15: note: 'text' was not declared 'constexpr'
+   10 |   const char* text = std::getenv("SQL");
+      |               ^~~~
+gmake[3]: *** [CMakeFiles/nc_runtime_charptr.dir/build.make:79: CMakeFiles/nc_runtime_charptr.dir/tests/nc/runtime_charptr.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:296: CMakeFiles/nc_runtime_charptr.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:303: CMakeFiles/nc_runtime_charptr.dir/rule] Error 2
+gmake: *** [Makefile:212: nc_runtime_charptr] Error 2
+<end of output>
+Test time =   3.77 sec
+----------------------------------------------------------
+Test Passed.
+"nc_runtime_charptr" end time: Sep 15 05:27 EEST
+"nc_runtime_charptr" time elapsed: 00:00:03
+----------------------------------------------------------
+
+4/6 Testing: nc_uint64_column
+4/6 Test: nc_uint64_column
+Command: "/usr/bin/cmake" "--build" "/home/hs/saltherring/build-trunk" "--target" "nc_uint64_column"
+Directory: /home/hs/saltherring/build-trunk
+"nc_uint64_column" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+[100%] Building CXX object CMakeFiles/nc_uint64_column.dir/tests/nc/uint64_column.cpp.o
+In file included from /home/hs/saltherring/tests/nc/uint64_column.cpp:4:
+/home/hs/saltherring/include/saltherring/saltherring.hpp: In instantiation of 'consteval salt::col_kind salt::detail::kind_of() [with M = long unsigned int]':
+/home/hs/saltherring/include/saltherring/saltherring.hpp:388:26:   required from 'constexpr const std::array<salt::column_info, 2> salt::detail::columns<Cert>'
+  388 |       c.kind = kind_of<M>();
+      |                ~~~~~~~~~~^~
+/home/hs/saltherring/include/saltherring/saltherring.hpp:432:31:   required from 'consteval std::size_t salt::detail::pk_count() [with T = Cert; std::size_t = long unsigned int]'
+  432 |   for (const column_info& c : columns<T>) n += c.is_pk;
+      |                               ^~~~~~~~~~
+/home/hs/saltherring/include/saltherring/saltherring.hpp:835:50:   required from 'std::string salt::create_table_sql(const dialect&) [with T = Cert; std::string = std::__cxx11::basic_string<char>]'
+  835 |   constexpr std::size_t pks = detail::pk_count<T>();
+      |                               ~~~~~~~~~~~~~~~~~~~^~
+/home/hs/saltherring/tests/nc/uint64_column.cpp:14:37:   required from here
+   14 |   (void)salt::create_table_sql<Cert>(salt::sqlite_dialect);
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+/home/hs/saltherring/include/saltherring/saltherring.hpp:427:49:   in 'constexpr' expansion of 'salt::detail::build_columns<Cert>()'
+  427 | inline constexpr auto columns = build_columns<T>();
+      |                                 ~~~~~~~~~~~~~~~~^~
+/home/hs/saltherring/include/saltherring/saltherring.hpp:357:19: error: static assertion failed: saltherring: 64-bit unsigned (and wider) integers cannot round-trip through SQL BIGINT — store as text or a BLOB instead
+  357 |     static_assert(!lossy_integral<U>,
+      |                   ^~~~~~~~~~~~~~~~~~
+  • '! lossy_integral<long unsigned int>' evaluates to false
+gmake[3]: *** [CMakeFiles/nc_uint64_column.dir/build.make:79: CMakeFiles/nc_uint64_column.dir/tests/nc/uint64_column.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:328: CMakeFiles/nc_uint64_column.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:335: CMakeFiles/nc_uint64_column.dir/rule] Error 2
+gmake: *** [Makefile:225: nc_uint64_column] Error 2
+<end of output>
+Test time =   3.40 sec
+----------------------------------------------------------
+Test Passed.
+"nc_uint64_column" end time: Sep 15 05:27 EEST
+"nc_uint64_column" time elapsed: 00:00:03
+----------------------------------------------------------
+
+5/6 Testing: nc_bad_identifier
+5/6 Test: nc_bad_identifier
+Command: "/usr/bin/cmake" "--build" "/home/hs/saltherring/build-trunk" "--target" "nc_bad_identifier"
+Directory: /home/hs/saltherring/build-trunk
+"nc_bad_identifier" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+[100%] Building CXX object CMakeFiles/nc_bad_identifier.dir/tests/nc/bad_identifier.cpp.o
+In file included from /home/hs/saltherring/tests/nc/bad_identifier.cpp:3:
+/home/hs/saltherring/include/saltherring/saltherring.hpp: In instantiation of 'std::string salt::create_table_sql(const dialect&) [with T = Bad; std::string = std::__cxx11::basic_string<char>]':
+/home/hs/saltherring/tests/nc/bad_identifier.cpp:10:36:   required from here
+   10 |   (void)salt::create_table_sql<Bad>(salt::sqlite_dialect);
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+/home/hs/saltherring/include/saltherring/saltherring.hpp:832:30: error: uncaught exception '(const char*)"saltherring: identifier may contain only [A-Za-z0-9_]"'
+  832 |   constexpr std::string_view tname = table_of<T>();
+      |                              ^~~~~
+gmake[3]: *** [CMakeFiles/nc_bad_identifier.dir/build.make:79: CMakeFiles/nc_bad_identifier.dir/tests/nc/bad_identifier.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:360: CMakeFiles/nc_bad_identifier.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:367: CMakeFiles/nc_bad_identifier.dir/rule] Error 2
+gmake: *** [Makefile:238: nc_bad_identifier] Error 2
+<end of output>
+Test time =   3.38 sec
+----------------------------------------------------------
+Test Passed.
+"nc_bad_identifier" end time: Sep 15 05:27 EEST
+"nc_bad_identifier" time elapsed: 00:00:03
+----------------------------------------------------------
+
+6/6 Testing: nc_composite_find
+6/6 Test: nc_composite_find
+Command: "/usr/bin/cmake" "--build" "/home/hs/saltherring/build-trunk" "--target" "nc_composite_find"
+Directory: /home/hs/saltherring/build-trunk
+"nc_composite_find" start time: Sep 15 05:27 EEST
+Output:
+----------------------------------------------------------
+[100%] Building CXX object CMakeFiles/nc_composite_find.dir/tests/nc/composite_find.cpp.o
+/home/hs/saltherring/tests/nc/composite_find.cpp: In function 'int main()':
+/home/hs/saltherring/tests/nc/composite_find.cpp:18:23: error: no matching function for call to 'salt::db::find<Pair>(std::string)'
+   18 |   (void)db->find<Pair>(std::string("half-a-key"));
+      |         ~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  • there is 1 candidate
+In file included from /home/hs/saltherring/tests/nc/composite_find.cpp:5:
+    • candidate 1: 'template<class T, class K>  requires  keyed_entity<T> salt::result<std::optional<_Tp> > salt::db::find(const K&)'
+      /home/hs/saltherring/include/saltherring/saltherring.hpp:1073:28:
+       1073 |   result<std::optional<T>> find(const K& key) {
+            |                            ^~~~
+      • template argument deduction/substitution failed:
+        • constraints not satisfied
+          • /home/hs/saltherring/include/saltherring/saltherring.hpp: In substitution of 'template<class T, class K>  requires  keyed_entity<T> salt::result<std::optional<_Tp> > salt::db::find(const K&) [with T = Pair; K = std::__cxx11::basic_string<char>]':
+          • required from here
+            /home/hs/saltherring/tests/nc/composite_find.cpp:18:23:   
+               18 |   (void)db->find<Pair>(std::string("half-a-key"));
+                  |         ~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+          • required for the satisfaction of 'keyed_entity<T>' [with T = Pair]
+            /home/hs/saltherring/include/saltherring/saltherring.hpp:447:9:   
+              447 | concept keyed_entity = entity<T> && pk_count<T>() == 1;
+                  |         ^~~~~~~~~~~~
+          • the expression '(pk_count<T>)() == 1 [with T = Pair]' evaluated to 'false'
+            /home/hs/saltherring/include/saltherring/saltherring.hpp:447:51:
+              447 | concept keyed_entity = entity<T> && pk_count<T>() == 1;
+                  |                                     ~~~~~~~~~~~~~~^~~~
+gmake[3]: *** [CMakeFiles/nc_composite_find.dir/build.make:79: CMakeFiles/nc_composite_find.dir/tests/nc/composite_find.cpp.o] Error 1
+gmake[2]: *** [CMakeFiles/Makefile2:392: CMakeFiles/nc_composite_find.dir/all] Error 2
+gmake[1]: *** [CMakeFiles/Makefile2:399: CMakeFiles/nc_composite_find.dir/rule] Error 2
+gmake: *** [Makefile:251: nc_composite_find] Error 2
+<end of output>
+Test time =   3.82 sec
+----------------------------------------------------------
+Test Passed.
+"nc_composite_find" end time: Sep 15 05:27 EEST
+"nc_composite_find" time elapsed: 00:00:03
+----------------------------------------------------------
+
+End testing: Sep 15 05:27 EEST

@@ -1,0 +1,51 @@
+# Server containers for the saltherring server test suites.
+#   docker compose -f tests/containers/docker-compose.yml up -d --wait
+#   ctest --test-dir build -L server --output-on-failure
+#   docker compose -f tests/containers/docker-compose.yml down -v
+# Or in one shot: scripts/server-tests.sh
+#
+# Non-default loopback ports so a developer's own local servers are never
+# touched by accident; tmpfs data dirs so state is fast and disposable.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: salt
+      POSTGRES_PASSWORD: salt
+      POSTGRES_DB: salt_test
+    ports:
+      - "127.0.0.1:15432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U salt -d salt_test"]
+      interval: 1s
+      retries: 30
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PASSWORD: salt        # SYS / SYSTEM password
+      APP_USER: salt
+      APP_USER_PASSWORD: salt
+    ports:
+      - "127.0.0.1:11521:1521"
+    # The image ships its own healthcheck; first start takes ~1 minute.
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_USER: salt
+      MARIADB_PASSWORD: salt
+      MARIADB_DATABASE: salt_test
+      MARIADB_ROOT_PASSWORD: root
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:33069:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 1s
+      retries: 60

@@ -45,6 +45,7 @@ int sqlite3_extended_result_codes(sqlite3*, int);
 int sqlite3_busy_timeout(sqlite3*, int);
 int sqlite3_db_config(sqlite3*, int, ...);
 int sqlite3_libversion_number(void);
+long long sqlite3_changes64(sqlite3*);
 }
 #define SQLITE_OK 0
 #define SQLITE_ROW 100
@@ -76,13 +77,16 @@ int sqlite3_libversion_number(void);
 #ifndef SQLITE_DBCONFIG_DEFENSIVE
 #define SQLITE_DBCONFIG_DEFENSIVE 1010
 #endif
+#ifndef SQLITE_CONSTRAINT
+#define SQLITE_CONSTRAINT 19
+#endif
 
 namespace salt::sqlite {
 
-// 3.35.0: RETURNING, ALTER TABLE DROP COLUMN, and every API this driver
-// declares. Older libraries fail open() rather than failing mysteriously
-// mid-migration.
-inline constexpr int min_libversion = 3035000;
+// 3.37.0: sqlite3_changes64, plus everything 3.35 brought (RETURNING,
+// ALTER TABLE DROP COLUMN) and every API this driver declares. Older
+// libraries fail open() rather than failing mysteriously mid-migration.
+inline constexpr int min_libversion = 3037000;
 
 struct options {
   bool create = true;           // create the file if missing
@@ -136,7 +140,10 @@ class statement final : public backend::statement {
     int rc = sqlite3_step(s_);
     if (rc == SQLITE_ROW) return true;
     if (rc == SQLITE_DONE) return false;
-    return fail(errc::exec, sqlite3_errmsg(c_));
+    // Extended result codes are on; the low byte is the primary class.
+    return fail((rc & 0xff) == SQLITE_CONSTRAINT ? errc::constraint
+                                                 : errc::exec,
+                sqlite3_errmsg(c_));
   }
 
   result<sql_value> column(int index) override {
@@ -161,6 +168,13 @@ class statement final : public backend::statement {
   }
 
   int column_count() override { return sqlite3_column_count(s_); }
+
+  result<std::int64_t> affected() override {
+    // Connection-scoped in the C API, statement-scoped by calling position:
+    // salt::db reads it immediately after this statement stepped to done,
+    // before anything else runs on the connection.
+    return std::int64_t(sqlite3_changes64(c_));
+  }
 
  private:
   sqlite3* c_;
@@ -211,7 +225,9 @@ class connection final : public backend::connection {
         while ((rc = sqlite3_step(s)) == SQLITE_ROW) {}
         sqlite3_finalize(s);
         if (rc != SQLITE_DONE)
-          return fail(errc::exec, sqlite3_errmsg(c_), std::string(p));
+          return fail((rc & 0xff) == SQLITE_CONSTRAINT ? errc::constraint
+                                                       : errc::exec,
+                      sqlite3_errmsg(c_), std::string(p));
       }
       p = tail;
     }

@@ -97,11 +97,48 @@ plus what this library hit:
   blob (caught by the conformance suite).
 - **Postgres**: `PQexecParams`, text parameters (binary for bytea), results
   shaped by Oid; ids come from `INSERT ... RETURNING`
-  (`dialect.insert_returning`), so `last_insert_id` is never used.
+  (`dialect.insert_returning`), so `last_insert_id` is never used. A text
+  parameter with an embedded NUL is refused at bind (`errc::bind`) —
+  Postgres TEXT cannot store it, and text-format params would silently
+  truncate at the NUL otherwise.
 - **MariaDB**: `mysql_stmt_*` prepared statements; result strings fetched
   with a zero-length probe + `mysql_stmt_fetch_column` refetch; charset 63
   distinguishes BLOB from TEXT; `my_bool` vs `bool` handled by deducing from
-  `MYSQL_BIND`.
-- The pg and mariadb drivers are written to their client APIs but this
-  machine has neither installed — they compile only where the headers exist
-  and are not yet covered by CI. The dialect SQL they run *is* unit-tested.
+  `MYSQL_BIND`. Connects with `CLIENT_FOUND_ROWS` so `execute()` reports
+  matched rows like the other drivers, and utf8mb4 for full unicode.
+- Bugs the first container runs caught (2026-09-15), for pattern-matching
+  in future drivers: MariaDB param arrays must be sized once up front —
+  `MYSQL_BIND` keeps raw pointers into them and a `resize()` between
+  `bind()` calls dangles every earlier buffer (garbage values that often
+  *happen* to read back correctly); a second statement's error in
+  multi-statement `exec` arrives via `mysql_next_result() > 0`, not from
+  `mysql_real_query`; empty string/blob binds must not pass a null buffer
+  (sends NULL — same bug class as SQLite's empty-blob bind); MariaDB
+  `TEXT`/`BLOB` cap at 64 KiB, so the dialect uses LONGTEXT/LONGBLOB.
+- **Oracle** (23ai+, over OCI / Instant Client): identifiers quoted
+  UPPERCASE (`dialect.fold_upper`) so unquoted tails — which Oracle folds
+  to upper — keep matching; `''` IS NULL surfaced, not hidden (empty text
+  binds send NULL; empty *blobs* stay real via temporary-LOB binds);
+  `INSERT ... RETURNING "ID"` rewritten to `RETURNING ... INTO :sr_ret`
+  with an OCIBindDynamic out-bind (last_insert_id has no table context, so
+  currval was not an option); exec() splits top-level ';' client-side and
+  sends BEGIN/DECLARE text whole as PL/SQL; RELEASE SAVEPOINT is a no-op
+  (Oracle has none); transactions are recognized from the statements
+  salt::db emits (SET TRANSACTION / COMMIT / ROLLBACK) and everything else
+  autocommits via OCI_COMMIT_ON_SUCCESS; NUMBER with declared precision
+  and scale 0 fetches as int64, undeclared NUMBER (COUNT(*), literals) as
+  BINARY_DOUBLE — from_sql's integral-REAL path recovers counts exactly.
+  Env is created AL32UTF8 explicitly so unicode survives without NLS_LANG.
+  Build against an Instant Client dir (`SALTHERRING_ORACLE_CLIENT_DIR`);
+  the test binary links with classic DT_RPATH (`--disable-new-dtags`)
+  because libclntsh's own deps resolve transitively only through RPATH.
+  Ubuntu 24.04's libaio1t64 renamed the soname to `libaio.so.1t64`, so the
+  client dir carries a `libaio.so.1` symlink to it (the t64 transition's
+  standard workaround; a benign "no version information" warning remains).
+- All server drivers pass the conformance suite and their dialect suites
+  against real containers: `scripts/server-tests.sh`, or
+  `tests/containers/docker-compose.yml` + `ctest -L server` by hand
+  (postgres:17-alpine, mariadb:11.4, gvenzl/oracle-free:23-slim).
+  No reachable server = SKIP (exit 77), so plain ctest needs no Docker.
+  CI with a GCC 16.1 toolchain image is planned
+  (internal/server-test-plan.md, phase 3).

@@ -16,6 +16,7 @@ live in [examples/](examples/) (`quickstart`, `columns`, `transactions`,
 - [Five-minute tour](#five-minute-tour)
 - [Modeling: structs to tables](#modeling-structs-to-tables)
 - [Opening a database](#opening-a-database)
+- [Backend setup: what each one needs on the host](#backend-setup-what-each-one-needs-on-the-host)
 - [Reading and writing](#reading-and-writing)
 - [SQL text: the rules](#sql-text-the-rules)
 - [Errors](#errors)
@@ -169,12 +170,132 @@ auto db = salt::pg::open("host=localhost dbname=app user=app");
 
 #include <saltherring/mariadb.hpp>  // needs the MariaDB/MySQL client headers
 auto db2 = salt::mariadb::open("localhost", "app", password, "appdb");  // port = 3306
+
+#include <saltherring/oracle.hpp>   // needs the Oracle Instant Client SDK
+auto db3 = salt::oracle::open("localhost:1521/FREEPDB1", "app", password);
 ```
 
-Both drivers compile only where the client headers exist. The SQL each
-dialect generates is unit-tested without a server; the drivers themselves
-should be certified with the [conformance suite](#dialects-and-drivers)
-against a real server before production use.
+The server drivers compile only where their client headers exist
+(`libpq-dev` / `libmariadb-dev` / the Instant Client SDK via
+`-DSALTHERRING_ORACLE_CLIENT_DIR`), and all pass the
+[conformance suite](#dialects-and-drivers) plus dialect-specific suites
+against real containerized servers: `scripts/server-tests.sh` starts
+PostgreSQL, MariaDB and Oracle Free via Docker Compose, runs
+`ctest -L server`, and tears them down. Without a reachable server those
+tests skip, so plain `ctest` needs no Docker.
+
+Engine notes the drivers surface rather than hide:
+
+- **MariaDB** — text/blob columns are `LONGTEXT`/`LONGBLOB` (plain
+  `TEXT`/`BLOB` cap at 64 KiB).
+- **Postgres** — TEXT cannot store NUL bytes; the driver refuses such
+  binds with `errc::bind` rather than truncating.
+- **Oracle (23ai+)** — `''` IS NULL: an empty optional string reads back
+  as `nullopt`, and a non-optional empty string is a NOT NULL violation.
+  Text columns are `VARCHAR2(4000)`; store larger text as a BLOB.
+  Identifiers are quoted UPPERCASE so unquoted names in tails keep
+  working; ids arrive via `RETURNING ... INTO`; DDL commits implicitly
+  (the MariaDB migration caveat applies).
+
+## Backend setup: what each one needs on the host
+
+saltherring is header-only; what varies per backend is which client pieces
+must exist on the machine that builds and runs your application. The
+servers themselves can live anywhere (the test suites run them in
+containers) — only the client library is a host concern.
+
+| backend | build needs | runtime needs | CMake |
+|---|---|---|---|
+| SQLite | nothing (header optional) | `libsqlite3.so.0` ≥ 3.37 | link `-lsqlite3` or `-l:libsqlite3.so.0` |
+| PostgreSQL | `libpq-dev` | `libpq.so.5` (`libpq5`) | auto-detected |
+| MariaDB/MySQL | `libmariadb-dev` | `libmariadb.so.3` | auto-detected |
+| Oracle | Instant Client **sdk** zip | Instant Client **basiclite** zip (+ libaio, see below) | `-DSALTHERRING_ORACLE_CLIENT_DIR` |
+
+### SQLite
+
+Nothing to install for the build: when `<sqlite3.h>` is absent the driver
+declares the frozen C ABI itself. At runtime only the shared library must
+resolve — link `-lsqlite3` with the dev package, or `-l:libsqlite3.so.0`
+without it. The library must be 3.37.0+ (`sqlite3_changes64`,
+`RETURNING`); older libraries fail `open()` with a clear message rather
+than misbehaving later.
+
+### PostgreSQL
+
+```
+apt install libpq-dev          # build: postgresql/libpq-fe.h
+```
+
+Runtime needs `libpq.so.5` (package `libpq5`, pulled in by `libpq-dev`);
+deployment hosts that only run the binary need just `libpq5`. This
+repository's CMake finds both automatically and builds `test_pg` when
+present.
+
+### MariaDB/MySQL
+
+```
+apt install libmariadb-dev     # build: mariadb/mysql.h
+```
+
+Runtime needs `libmariadb.so.3` (package `libmariadb3`). Auto-detected by
+CMake the same way.
+
+### Oracle
+
+Oracle's client is not in the distro archives — download both Instant
+Client zips (free, no login) and unpack them into one directory:
+
+```
+mkdir -p /opt/oracle && cd /opt/oracle
+curl -LO https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+curl -LO https://download.oracle.com/otn_software/linux/instantclient/instantclient-sdk-linuxx64.zip
+unzip instantclient-basiclite-linuxx64.zip && unzip instantclient-sdk-linuxx64.zip
+# → /opt/oracle/instantclient_23_26 with libclntsh.so* and sdk/include/oci.h
+```
+
+Point the build at it:
+
+```
+cmake --preset gcc16 -DSALTHERRING_ORACLE_CLIENT_DIR=/opt/oracle/instantclient_23_26
+```
+
+Two things every Oracle-linked binary must get right at runtime:
+
+1. **Library resolution must be transitive.** `libclntsh.so` pulls in
+   `libclntshcore`, `libnnz` and `libaio` from its own directory, and the
+   modern `DT_RUNPATH` is *not* consulted for a library's own
+   dependencies. Either export the directory —
+   `export LD_LIBRARY_PATH=/opt/oracle/instantclient_23_26` — or link
+   with classic RPATH the way this repo's tests do:
+   `-Wl,--disable-new-dtags,-rpath,/opt/oracle/instantclient_23_26`.
+   (A third option for system-wide installs: drop the path into
+   `/etc/ld.so.conf.d/oracle.conf` and run `ldconfig`.)
+2. **libaio, with the Ubuntu 24.04 rename.** `libclntsh` needs
+   `libaio.so.1`; Ubuntu 24.04's package is `libaio1t64` and its soname is
+   `libaio.so.1t64`, so the package alone does not satisfy the loader.
+   Create the symlink once, somewhere on the resolution path — the client
+   directory itself is the tidy spot:
+
+   ```
+   apt install libaio1t64
+   ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 \
+         /opt/oracle/instantclient_23_26/libaio.so.1
+   ```
+
+   (Distros whose package still ships `libaio.so.1` — Debian 12, RHEL —
+   need no symlink. The "no version information available" warning the
+   symlink produces is benign.)
+
+### The server test suites
+
+`ctest -L server` connects using env vars, with defaults matching
+[tests/containers/docker-compose.yml](tests/containers/docker-compose.yml):
+`SALT_PG_DSN`, `SALT_MARIADB_HOST/PORT/USER/PASSWORD`,
+`SALT_ORACLE_CONNECT`/`SALT_ORACLE_SYSTEM_PASSWORD`. No reachable server
+means SKIP, never FAIL. One caveat: after a cold `docker compose down -v`,
+Oracle rebuilds its database and registers the `FREEPDB1` service a minute
+or so *after* the container reports healthy — a suite run in that window
+skips; rerun and it passes.
 
 ## Reading and writing
 

@@ -56,8 +56,17 @@ inline int run(const std::function<salt::db()>& fresh_db) {
   check(bool(db.create_table<kinds>()), "create_table");
 
   // Storage classes at their edges; text may hold unicode and NUL bytes.
+  //
+  // Engine difference, documented: SQLite TEXT is an arbitrary byte string
+  // and must round-trip an embedded NUL; PostgreSQL validates text values
+  // server-side and rejects NUL outright (SQLSTATE 22021, "invalid byte
+  // sequence for encoding UTF8: 0x00") — for every driver, libpq included.
+  // The NUL stays asserted for SQLite (and any engine that takes it);
+  // Postgres proves the unicode round-trip without it. Data that genuinely
+  // contains NUL belongs in a BLOB column on Postgres.
+  const bool text_takes_nul = db.dial().name != "postgresql";
   std::string tricky = "häräntappoase 🐟 ";
-  tricky.push_back('\0');
+  if (text_takes_nul) tricky.push_back('\0');
   tricky += "end";
   kinds k{.flag = true,
           .tiny = std::numeric_limits<std::int8_t>::min(),
@@ -87,8 +96,21 @@ inline int run(const std::function<salt::db()>& fresh_db) {
     check(g.at == k.at, "sys_seconds round-trip");
   }
 
-  // Empty string stays distinct from NULL; int64 max survives.
+  // A backend whose TEXT rejects NUL must refuse the bind loudly — silent
+  // truncation is the failure mode this check exists to prevent.
+  if (!text_takes_nul) {
+    kinds bad{.text = std::string("a\0b", 3)};
+    auto refused = db.insert(bad);
+    check(!refused && refused.error().code == salt::errc::bind,
+          "NUL in TEXT refused with errc::bind, not truncated");
+  }
+
+  // Empty string stays distinct from NULL — except on Oracle, where
+  // '' IS NULL is engine semantics: there an empty optional string reads
+  // back as nullopt, and code that must distinguish uses a BLOB.
+  const bool empty_text_is_null = db.dial().name == "oracle";
   kinds k2{.big = std::numeric_limits<std::int64_t>::max(),
+           .text = "k2",
            .maybe = std::string{}};
   check(bool(db.insert(k2)), "second insert");
   auto got2 = db.find<kinds>(k2.id);
@@ -96,12 +118,16 @@ inline int run(const std::function<salt::db()>& fresh_db) {
   if (got2 && *got2) {
     check((*got2)->big == std::numeric_limits<std::int64_t>::max(),
           "int64 max round-trip");
-    check((*got2)->maybe.has_value() && (*got2)->maybe->empty(),
-          "empty string is not NULL");
+    if (empty_text_is_null)
+      check(!(*got2)->maybe.has_value(), "'' IS NULL on this engine");
+    else
+      check((*got2)->maybe.has_value() && (*got2)->maybe->empty(),
+            "empty string is not NULL");
   }
 
-  // A 1 MiB blob.
-  kinds kb{.bytes = std::vector<std::uint8_t>(1 << 20)};
+  // A 1 MiB blob. (Non-empty text everywhere below: a non-optional string
+  // member left empty cannot insert on Oracle — '' IS NULL meets NOT NULL.)
+  kinds kb{.text = "blob row", .bytes = std::vector<std::uint8_t>(1 << 20)};
   for (std::size_t i = 0; i < kb.bytes.size(); ++i)
     kb.bytes[i] = std::uint8_t(i * 131);
   check(bool(db.insert(kb)), "1 MiB blob insert");
@@ -111,7 +137,7 @@ inline int run(const std::function<salt::db()>& fresh_db) {
   // Bulk: 10 000 rows in one transaction, all fetched back.
   auto bulk = db.transaction([&]() -> salt::result<void> {
     for (int i = 0; i < 10'000; ++i) {
-      kinds r{.big = i};
+      kinds r{.big = i, .text = "row"};
       if (auto ins = db.insert(r); !ins) return std::unexpected(ins.error());
     }
     return {};
@@ -130,10 +156,24 @@ inline int run(const std::function<salt::db()>& fresh_db) {
   check(db.scalar<std::int64_t>("SELECT COUNT(*) FROM conf_two").value_or(-1) == 1,
         "multi-statement exec really ran");
 
+  // Rows-affected is statement-scoped and exact: N matched → N, none → 0,
+  // and a SELECT through execute() reports 0 rather than garbage.
+  check(db.execute("UPDATE conf_kinds SET flag = ? WHERE big >= ? AND big < ?",
+                   true, std::int64_t{5}, std::int64_t{8})
+                .value_or(-1) == 3,
+        "execute reports matched-row count");
+  check(db.execute("UPDATE conf_kinds SET flag = ? WHERE big = ?",
+                   true, std::int64_t{-777})
+                .value_or(-1) == 0,
+        "execute reports zero for a no-match update");
+  check(db.execute("DELETE FROM conf_two WHERE x = ?", std::int64_t{1})
+                .value_or(-1) == 1,
+        "execute reports delete count");
+
   // Transactions roll back on error; nested ones are savepoints.
   auto before = db.count<kinds>().value_or(-1);
   auto tx = db.transaction([&]() -> salt::result<void> {
-    kinds r{};
+    kinds r{.text = "tx"};
     if (auto ins = db.insert(r); !ins) return std::unexpected(ins.error());
     return salt::fail(salt::errc::exec, "abort on purpose");
   });
@@ -141,10 +181,10 @@ inline int run(const std::function<salt::db()>& fresh_db) {
   check(db.count<kinds>().value_or(-1) == before, "failed transaction rolled back");
 
   auto nested = db.transaction([&]() -> salt::result<void> {
-    kinds outer{};
+    kinds outer{.text = "outer"};
     if (auto ins = db.insert(outer); !ins) return std::unexpected(ins.error());
     auto inner = db.transaction([&]() -> salt::result<void> {
-      kinds in{};
+      kinds in{.text = "inner"};
       if (auto ins = db.insert(in); !ins) return std::unexpected(ins.error());
       return salt::fail(salt::errc::exec, "inner abort");
     });

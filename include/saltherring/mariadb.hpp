@@ -36,18 +36,21 @@ using bool_t = std::remove_pointer_t<decltype(MYSQL_BIND{}.is_null)>;
 
 class statement final : public backend::statement {
  public:
-  explicit statement(MYSQL_STMT* s) : s_(s) {}
+  // Param storage is sized once, up front: MYSQL_BIND keeps raw pointers
+  // into params_ (&p.i, &p.len), so params_ must never reallocate between
+  // bind() and execute().
+  explicit statement(MYSQL_STMT* s)
+      : s_(s), params_(mysql_stmt_param_count(s)), binds_(params_.size()) {}
   ~statement() override { mysql_stmt_close(s_); }
   statement(const statement&) = delete;
   statement& operator=(const statement&) = delete;
 
   result<void> bind(int index, const sql_value& v) override {
-    if (index < 1) return fail(errc::bind, "bind index must be >= 1");
+    if (index < 1 || std::size_t(index) > params_.size())
+      return fail(errc::bind,
+                  std::format("bind index {} outside 1..{}", index,
+                              params_.size()));
     std::size_t i = std::size_t(index) - 1;
-    if (params_.size() <= i) {
-      params_.resize(i + 1);
-      binds_.resize(i + 1);
-    }
     param& p = params_[i];
     MYSQL_BIND& b = binds_[i];
     std::memset(&b, 0, sizeof b);
@@ -73,7 +76,11 @@ class statement final : public backend::statement {
               b.buffer_type = MYSQL_TYPE_BLOB;
             }
             p.len = p.bytes.size();
-            b.buffer = p.bytes.data();
+            // An empty vector's data() may be null, and a null buffer sends
+            // NULL rather than an empty string/blob — keep them distinct.
+            static char empty_buf = 0;
+            b.buffer = p.bytes.empty() ? static_cast<void*>(&empty_buf)
+                                       : p.bytes.data();
             b.buffer_length = p.bytes.size();
             b.length = &p.len;
           }
@@ -123,6 +130,13 @@ class statement final : public backend::statement {
 
   int column_count() override { return int(cols_.size()); }
 
+  result<std::int64_t> affected() override {
+    // (my_ulonglong)-1 means "error / not applicable" (e.g. a SELECT).
+    auto n = mysql_stmt_affected_rows(s_);
+    if (n == static_cast<decltype(n)>(-1)) return std::int64_t{0};
+    return std::int64_t(n);
+  }
+
  private:
   struct param {
     std::int64_t i = 0;
@@ -142,8 +156,16 @@ class statement final : public backend::statement {
   result<void> execute() {
     if (!params_.empty() && mysql_stmt_bind_param(s_, binds_.data()) != 0)
       return fail(errc::bind, mysql_stmt_error(s_));
-    if (mysql_stmt_execute(s_) != 0)
-      return fail(errc::exec, mysql_stmt_error(s_));
+    if (mysql_stmt_execute(s_) != 0) {
+      // The integrity-violation family: duplicate key, FK child/parent,
+      // NOT NULL, CHECK.
+      switch (mysql_stmt_errno(s_)) {
+        case 1022: case 1048: case 1062: case 1451: case 1452: case 3819:
+          return fail(errc::constraint, mysql_stmt_error(s_));
+        default:
+          return fail(errc::exec, mysql_stmt_error(s_));
+      }
+    }
     executed_ = true;
     meta_ = mysql_stmt_result_metadata(s_);
     if (!meta_) return {};  // statement without a result set
@@ -221,12 +243,17 @@ class connection final : public backend::connection {
   }
 
   result<void> exec(std::string_view sql) override {
-    // CLIENT_MULTI_STATEMENTS is on: drain every result set.
+    // CLIENT_MULTI_STATEMENTS is on: drain every result set. A statement
+    // after the first reports its error through mysql_next_result (> 0) —
+    // -1 is "no more results", not an error.
     if (mysql_real_query(c_, sql.data(), sql.size()) != 0)
       return fail(errc::exec, mysql_error(c_), std::string(sql));
-    do {
+    for (;;) {
       if (MYSQL_RES* r = mysql_store_result(c_)) mysql_free_result(r);
-    } while (mysql_next_result(c_) == 0);
+      int rc = mysql_next_result(c_);
+      if (rc == -1) break;
+      if (rc > 0) return fail(errc::exec, mysql_error(c_), std::string(sql));
+    }
     return {};
   }
 
@@ -246,8 +273,10 @@ inline result<db> open(const char* host, const char* user, const char* password,
                        const char* database, unsigned port = 3306) {
   MYSQL* c = mysql_init(nullptr);
   if (!c) return fail(errc::connect, "mysql_init: out of memory");
+  // CLIENT_FOUND_ROWS: affected() reports matched rows, like SQLite and
+  // Postgres — not MySQL's default changed-rows count.
   if (!mysql_real_connect(c, host, user, password, database, port, nullptr,
-                          CLIENT_MULTI_STATEMENTS)) {
+                          CLIENT_MULTI_STATEMENTS | CLIENT_FOUND_ROWS)) {
     std::string msg = mysql_error(c);
     mysql_close(c);
     return fail(errc::connect, std::format("mariadb connect: {}", msg));

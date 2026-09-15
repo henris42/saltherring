@@ -9,35 +9,32 @@ location, the problem, the fix, and the test that proves it. Work in id
 order; S-1 changes the public API and should land first so the others
 build on it.
 
-Priorities: **P0** — breaks a storax-ca invariant or corrupts CA data;
-**P1** — correctness under CA load; **P2** — hardening and hygiene.
+**Design principle.** saltherring is a generic ORM, not a CA component.
+Every note below adds a *mechanism* with a default that suits a general
+user; the strict *policy* (which mode, which overloads are banned, which
+options are mandatory) lives in the application and is enforced there
+by lints, negative-compile tests, and wrapper types. Nothing here should
+remove a capability a generic user reasonably wants. Where a note says
+"storax-ca does X", that is application configuration, not library
+behaviour.
 
-## Status (2026-09-15)
-
-Implemented and tested (headers + `tests/test_saltherring.cpp`, `tests/nc/`,
-`tests/conformance.hpp`; suite green under GCC 16.1):
-S-1, S-2 (option 1: compile-time rejection), S-3, S-4, S-5, S-6, S-7, S-8,
-S-9 (pg.hpp side; conformance suite exists per S-12), S-10, S-11, S-13,
-S-14 (README security model + NOTES.md updates).
-
-Remaining: S-12's CI job with Postgres/MariaDB service containers (no CI
-config in this repo yet; `tests/conformance.hpp` is ready to point at those
-drivers), and S-9's driver checks are unexercised on this machine (no
-libpq-dev). Bonus fix found by the conformance suite: the SQLite driver
-bound empty blobs as NULL (`sqlite3_bind_blob` with a null `data()`).
+Priorities: **P0** — silent data corruption or an unsafe default;
+**P1** — correctness under concurrent or hostile use; **P2** — hardening
+and hygiene.
 
 ---
 
-## S-1 · P0 · Compile-time-only SQL tails (tenant-scope support)
+## S-1 · P0 · Literal-only SQL tail type (additive overloads)
 
 **Where**: `saltherring.hpp` — `db::exec` (744), `db::scalar` (758),
 `db::query` (831), `db::query_one` (844), `db::count` (883).
 
-**Problem**: All take a runtime `std::string_view` tail. Nothing prevents
-a caller from formatting user input into SQL. storax-ca's invariant
-"cross-tenant reads impossible by construction" needs the persistence
-layer to make runtime-built SQL uncompilable so a tenant-scoped wrapper
-can be the only caller.
+**Problem**: All take a runtime `std::string_view` tail, which is right
+for a generic ORM but gives a security-sensitive application no way to
+make runtime-built SQL uncompilable. The library should offer a
+literal-only tail type *alongside* the existing overloads; an
+application that wants the guarantee bans the `string_view` overloads
+with its own lint.
 
 **Fix**:
 ```cpp
@@ -54,13 +51,15 @@ struct unchecked_sql { std::string_view text; };
   `scalar<V>(sql, ...)`, `query_one<T>(sql, ...)`.
 - `migration::sql` / `::down` stay `string_view` (they are constexpr
   tables already); `migration::fn` code migrations use `db&` normally.
-- Provide `unchecked_sql` overloads so existing callers can migrate
-  explicitly; storax-ca's lint bans `unchecked_sql` outside its
-  tenant-scope module.
+- Keep the existing `std::string_view` overloads unchanged for generic
+  users; `sql` overloads are additive. `unchecked_sql` is for callers
+  that want to be explicit about runtime SQL. (storax-ca: lint bans the
+  `string_view` and `unchecked_sql` overloads outside its tenant-scope
+  module.)
 
-**Test**: negative-compile file `tests/nc/runtime_sql.cpp` —
-`db.query<User>(std::string("WHERE ") + x)` must fail; positive test that
-literal tails still work. storax-ca T-build-4 references this.
+**Test**: `db.query<User>(salt::sql{std::string(...)})` fails to
+compile; literal `sql` tails work; `string_view` tails still work.
+(storax-ca's T-build-4 tests its own ban, not the library.)
 
 ---
 
@@ -106,51 +105,102 @@ is drift detection, not tamper evidence.
 - Before executing a stored `down_sql`, recompute the checksum from the
   stored row and compare; refuse with a new `errc::migration_tampered`
   on mismatch.
-- Add `migrate_options::allow_unwind_missing_in_prod = false` (or make
-  `unwind_missing` require an explicit token type) so a production
-  binary cannot unwind history it does not know unless the operator
-  opts in per call.
+- `unwind_missing` stays available; it is a legitimate development
+  workflow. Add `migrate_options::verify_down_checksum = true` so a
+  tampered stored `down_sql` is refused by default, and document that
+  applications with forward-only production schemas should simply not
+  call `unwind_missing`/`rollback` there.
 - Document: a cryptographic tamper-evidence layer (signed history) is
   the application's job; storax-ca must not reuse this checksum for its
   audit chain.
 
+- **Migration atomicity per dialect.** Add a dialect capability flag
+  `transactional_ddl` (true: Postgres, SQLite; false: MySQL/MariaDB —
+  any DDL statement commits implicitly and cannot be rolled back, the
+  same as Oracle). `migrate()` uses one of two paths:
+  - *atomic*: DDL and the history row in one transaction;
+  - *recoverable*: insert the history row first with
+    `state = 'started'`, run the migration statement by statement, then
+    update to `state = 'applied'`. On the next `migrate()` a `started`
+    row means a crash mid-migration: refuse to proceed and report which
+    migration is half-applied, unless the migration is marked
+    `idempotent = true` (its SQL uses `IF NOT EXISTS` / `IF EXISTS`
+    forms), in which case re-run it. Add `state` to
+    `salt_schema_history` (default `applied` for existing rows).
+  MySQL 8.0's atomic DDL only makes a single DDL statement
+  all-or-nothing; it does not enlist DDL in the caller's transaction.
+
 **Test**: apply v1–v2, edit `down_sql` of v2 directly via `raw()`, call
 `rollback(db, 1)` → `migration_tampered`, table unchanged; same for
-`unwind_missing`.
+`unwind_missing`. On a non-`transactional_ddl` dialect (conformance
+suite, S-12): kill between DDL and history update → next `migrate()`
+refuses with the half-applied version named; same migration marked
+idempotent → re-run succeeds.
 
 ---
 
-## S-4 · P1 · Exception-safe transactions, savepoints, isolation
+## S-4 · P0 · Exception-safe transactions, savepoints, isolation; opt-in scoped mode
 
-**Where**: `db::transaction` (897–906).
+**Where**: `db::transaction` (897–906); every statement path in `db`.
 
-**Problem**: if `f()` throws, no `ROLLBACK` runs; the connection stays
-inside a transaction and the next `BEGIN` fails. No nesting, no way to
-choose isolation.
+**Problem**: if `f()` throws, no `ROLLBACK` runs and the connection stays
+mid-transaction. No savepoints, no isolation control. And there is no
+mode in which an application can insist that every statement runs
+inside a transaction it controls.
 
-**Fix**:
-```cpp
-template <typename F>
-result<void> transaction(F&& f, tx_options o = {}) {
-  if (auto b = exec(begin_sql(o)); !b) return b;   // BEGIN [ISOLATION LEVEL …]
-  bool done = false;
-  struct guard { db* d; bool* done; ~guard(){ if(!*done) (void)d->exec("ROLLBACK"); } } g{this,&done};
-  result<void> r = std::forward<F>(f)();
-  if (!r) return r;                                 // guard rolls back
-  r = exec("COMMIT"); done = true; return r;
-}
-```
-- `tx_options{ isolation: read_committed|repeatable_read|serializable, read_only }`
-  rendered per dialect (SQLite: `BEGIN IMMEDIATE` for write intent).
-- Nested calls use `SAVEPOINT sp_<depth>` / `RELEASE` / `ROLLBACK TO`;
-  track depth in `db`.
-- Provide `for_update` helper or document `SELECT … FOR UPDATE` in tails
-  (Postgres) and `BEGIN IMMEDIATE` (SQLite) for read-modify-write
-  patterns such as storax-ca's quorum computation.
+**Fix — generic part (default behaviour)**:
+- `transaction(f, tx_options)` with an RAII guard: rollback on error
+  return *and* on unwind. `tx_options{ isolation, immediate, read_only }`
+  rendered per dialect (`BEGIN IMMEDIATE` on SQLite,
+  `BEGIN ISOLATION LEVEL …` on Postgres).
+- Nested `transaction()` calls use `SAVEPOINT sp_<depth>` /
+  `RELEASE` / `ROLLBACK TO`; depth tracked in `db`.
+- Serialization failure (Postgres `40001`, SQLite `SQLITE_BUSY` on
+  lock upgrade, MySQL/MariaDB deadlock `1213` and lock-wait timeout
+  `1205`) surfaces as `errc::retryable`; the library never retries.
+- **Nesting must never reach the server as a second `BEGIN`.** On
+  MySQL/MariaDB, `START TRANSACTION` inside an open transaction
+  implicitly commits the outer one instead of nesting or erroring.
+  The depth counter in `db` is therefore the only thing standing
+  between a nested call and a silent partial commit: depth 0 → `BEGIN`,
+  depth ≥ 1 → `SAVEPOINT`, always. Assert this in the driver interface
+  (a driver receives `begin()` only at depth 0).
+- Drivers set session defaults explicitly on connect: MySQL/MariaDB
+  `SET autocommit = 0` (default is on) and
+  `SET SESSION TRANSACTION ISOLATION LEVEL …` per `tx_options`;
+  Postgres `SET default_transaction_isolation` likewise. Never rely on
+  server defaults.
+- Isolation note for the docs: MySQL `SERIALIZABLE` turns plain reads
+  into locking reads (deadlock-prone under parallel writers), Postgres
+  uses serializable snapshot isolation. Both satisfy the guarantee;
+  applications with parallel writers on MySQL should expect more
+  `retryable` results.
+- Expose the same guard as an RAII object for callers that prefer it:
+  ```cpp
+  [[nodiscard]] result<scope> begin(tx_options o = {});
+  // scope: move-only; commit() or destructor rollback.
+  ```
 
-**Test**: `transaction([]{ throw std::runtime_error{}; })` leaves the db
-usable (next `BEGIN` succeeds, no partial rows); nested savepoint rolls
-back inner only; SQLite `BEGIN IMMEDIATE` blocks a second writer.
+**Fix — opt-in `db_mode::scoped`** (for applications that want
+"one unit of work, one transaction, owned by a dispatcher"):
+- In this mode a statement executed with no open scope is a contract
+  violation, and nested `begin()` is a contract violation (no
+  savepoints; the boundary is the unit of work).
+- The library does not decide who owns the scope. An application that
+  wants handlers unable to open one hides the `scope` type behind its
+  own dispatcher (storax-ca does this; see enterprise plan §0.1).
+- Migrations open one scope per migration (DDL + history row) in both
+  modes.
+
+**Test**: `transaction([]{ throw …; })` leaves the connection usable and
+no partial rows; nested savepoint rolls back the inner unit only, and on
+MySQL/MariaDB the conformance suite proves the outer unit was *not*
+committed by the inner one; a driver receiving `begin()` at depth > 0
+trips a contract;
+`BEGIN IMMEDIATE` blocks a second writer; in `scoped` mode a bare
+statement trips the contract; kill -9 between two inserts in one scope →
+neither row after restart; a migration failing on its second statement
+leaves no history row.
 
 ---
 
@@ -211,16 +261,19 @@ system `libsqlite3.so.0` of unknown version.
   `sqlite3_db_config(c, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr)`,
   `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION = 0`,
   `sqlite3_busy_timeout(c, o.busy_ms)` (default 5000),
-  `PRAGMA journal_mode = WAL` (option), `PRAGMA synchronous = FULL`
-  (option, default for CA use), `PRAGMA secure_delete = ON` (option,
-  default on), `PRAGMA trusted_schema = OFF`, keep
-  `PRAGMA foreign_keys = ON`.
+  `PRAGMA journal_mode = WAL` (option, default off — file-layout
+  change), `PRAGMA synchronous` (option, default `NORMAL`; applications
+  that need durability over throughput choose `FULL`),
+  `PRAGMA secure_delete` (option, default off — it costs write
+  throughput; storax-ca turns it on), `PRAGMA trusted_schema = OFF`,
+  keep `PRAGMA foreign_keys = ON`. Defensive mode and no-extension-load
+  are on by default: they only remove footguns.
 - Add the missing declarations to the ABI shim (`sqlite3_open_v2`,
   `sqlite3_db_config`, `sqlite3_busy_timeout`,
   `sqlite3_extended_result_codes`, `sqlite3_libversion_number`) and
   refuse to open below a minimum `sqlite3_libversion_number()` (pick a
   version and document why).
-- Note for storax-ca: vendor the amalgamation compiled with
+- Application note (storax-ca): vendor the amalgamation compiled with
   `SQLITE_SECURE_DELETE`, `SQLITE_OMIT_LOAD_EXTENSION`,
   `SQLITE_DEFAULT_FOREIGN_KEYS=1`, `SQLITE_DQS=0`; don't depend on the
   container's shared library.
@@ -245,7 +298,9 @@ full statement. Errors flow into logs.
   enumerator of Level", `detail` carries the text.
 - Cap `detail` and `sql` at a configurable length (default 512) and add a
   `[[=salt::sensitive{}]]` member annotation: for such columns, `detail`
-  is left empty and the error notes "(redacted)".
+  is left empty and the error notes "(redacted)". Both default to the
+  current behaviour (values present) so generic users keep useful
+  diagnostics; `sensitive` is opt-in per column.
 - Document that `error.sql` never contains bound values (true today —
   keep it true; add a test).
 
@@ -323,8 +378,10 @@ against.
   `salt::db` factory: types round-trip (all `col_kind`s, NULL, empty
   string vs NULL, empty blob, max/min ints, NaN/inf policy), `RETURNING`
   vs `last_insert_id`, multi-statement `exec`, prepare rejects multiple
-  statements, transaction rollback on error, savepoints, unicode and
-  NUL-containing text, 1 MiB blob, 10 000-row fetch.
+  statements, transaction rollback on error, savepoints, nested-unit
+  isolation (S-4), `transactional_ddl` capability behaviour (S-3),
+  session defaults applied on connect, unicode and NUL-containing text,
+  1 MiB blob, 10 000-row fetch.
 - CI job with a Postgres service container that builds `pg.hpp` and
   runs the conformance suite; same for MariaDB if it stays supported.
 - storax-ca links the same conformance header against its own driver.
@@ -359,11 +416,30 @@ yields `… WHERE name = $1`.
   after S-1, "trusted" is enforced by the type system.
 - **Security model of migrations**: what the checksum proves and does
   not prove (after S-3).
+- **Dialect capability table**: `transactional_ddl`, `returning`,
+  savepoint support, implicit-commit statements (MySQL's list is long:
+  DDL, `LOCK TABLES`, `START TRANSACTION`, administrative statements),
+  default isolation, and which errors map to `errc::retryable`.
 - **SQLite deployment guidance** (after S-7): vendored amalgamation,
   compile options, file permissions (0600, directory 0700), WAL file
   handling in containers, backup via `VACUUM INTO` not file copy.
 
 ---
+
+## S-15 · P2 · Oracle support
+
+**DONE (2026-09-15).** `oracle_dialect` (`:n` placeholders, NUMBER/
+BINARY_DOUBLE/VARCHAR2(4000)/BLOB, identity pk, quoted-UPPERCASE
+identifiers via `dialect.fold_upper`), `oracle.hpp` OCI driver
+(RETURNING ... INTO out-bind for ids, temporary-LOB blob binds so empty
+blob ≠ NULL, client-side ';' splitter + PL/SQL passthrough, transaction
+statement recognition, AL32UTF8 env), gvenzl/oracle-free:23-slim in the
+compose file, `tests/test_oracle.cpp` green: conformance (with the
+documented '' IS NULL carve-out) + returning/exec-shapes/number-shaping/
+isolation/migration-caveat/tamper/lock-conflict suites.
+
+- add support for Oracle DB
+- use gvenzl/oracle-free container
 
 ## Mapping to storax-ca
 
@@ -372,7 +448,7 @@ yields `… WHERE name = $1`.
 | S-1 | T-build-4 (negative compile), T-authz-2 (tenant isolation) |
 | S-2 | T-iss-1 golden fixtures (serial storage), enterprise plan §0.1 |
 | S-3 | T-k8s-5 (migration safety), T-aud-3 (tamper detection) |
-| S-4 | T-wf-3 (vote race), T-dos-6 (torn issuance) |
+| S-4 | T-wf-3 (vote race), T-dos-6 (torn issuance), enterprise plan §0.1 dispatcher-transaction invariant |
 | S-5 | T-authz-3 spirit — no silent acceptance |
 | S-7 | T-sep-6 container hardening, §12 secrets (file permissions) |
 | S-8 | T-aud-2 redaction |
