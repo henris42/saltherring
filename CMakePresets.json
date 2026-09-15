@@ -1,0 +1,20 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "gcc16",
+      "displayName": "GCC 16.1 (/opt/gcc-16.1)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "/opt/gcc-16.1/bin/g++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_BUILD_RPATH": "/opt/gcc-16.1/lib64",
+        "CMAKE_EXE_LINKER_FLAGS": "-Wl,-rpath,/opt/gcc-16.1/lib64"
+      }
+    }
+  ],
+  "buildPresets": [{ "name": "gcc16", "configurePreset": "gcc16" }],
+  "testPresets": [
+    { "name": "gcc16", "configurePreset": "gcc16", "output": { "outputOnFailure": true } }
+  ]
+}
