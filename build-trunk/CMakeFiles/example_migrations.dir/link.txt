@@ -1,1 +1,0 @@
-/home/hs/toolchains/stage/usr/local/bin/g++ -g CMakeFiles/example_migrations.dir/examples/migrations.cpp.o -o example_migrations  -l:libsqlite3.so.0 -lstdc++exp

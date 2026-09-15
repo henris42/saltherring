@@ -1,7 +1,0 @@
-saltherring 1 0.141064
-nc_runtime_sql 1 3.7518
-nc_runtime_charptr 1 3.76781
-nc_uint64_column 1 3.40457
-nc_bad_identifier 1 3.37996
-nc_composite_find 1 3.82189
----

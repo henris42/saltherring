@@ -1,1 +1,0 @@
-/home/hs/toolchains/stage/usr/local/bin/g++ -g CMakeFiles/example_quickstart.dir/examples/quickstart.cpp.o -o example_quickstart  -l:libsqlite3.so.0 -lstdc++exp

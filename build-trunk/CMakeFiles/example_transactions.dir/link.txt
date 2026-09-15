@@ -1,1 +1,0 @@
-/home/hs/toolchains/stage/usr/local/bin/g++ -g CMakeFiles/example_transactions.dir/examples/transactions.cpp.o -o example_transactions  -l:libsqlite3.so.0 -lstdc++exp
