@@ -4,7 +4,7 @@ SQL persistence for C++26: tables, typed queries and schema version control
 for any struct, out of the box. Reflection maps objects to rows, annotations
 declare the schema, contracts guard the API — no macros, no codegen, no
 interface to implement. Column encoding is shared with
-[sardine](../sardine): what sardine can serialize, saltherring can persist.
+[sardine](https://github.com/henris42/sardine): what sardine can serialize, saltherring can persist.
 
 ```cpp
 struct [[=salt::table("users")]] User {
